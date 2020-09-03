@@ -1,5 +1,5 @@
 [package]
-name = "mempool"
+name = "mempool-sync"
 version = "0.1.0"
 authors = ["geli <xlugeli@163.com>"]
 edition = "2018"
