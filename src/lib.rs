@@ -64,6 +64,7 @@ pub type Stack<T> = Vec<T>;
 pub struct MemoryPool<T> {
     objects:Mutex<Stack<T>>,
     resources:(channel::Sender<()>,channel::Receiver<()>),
+    remains:Arc<Mutex<usize>>,
 }
 
 impl<T> MemoryPool<T> {
@@ -77,7 +78,7 @@ impl<T> MemoryPool<T> {
         for _ in 0..cap {
             objects.push(init());
         }
-
+       // println!("mempool remains:{}", cap);
         MemoryPool {
             objects: Mutex::new(objects),
             resources: {
@@ -86,7 +87,8 @@ impl<T> MemoryPool<T> {
                     res.0.send(());
                 }
                 res
-            }
+            },
+            remains:Arc::new(Mutex::new(cap)),
         }
     }
 
@@ -104,6 +106,12 @@ impl<T> MemoryPool<T> {
     #[inline]
     pub fn pull(&self ) -> Reusable<T> {
         self.resources.1.recv().unwrap();
+        {
+            let mut remains = self.remains.lock();
+            let remains = remains.deref_mut();
+            *remains -= 1;
+           // println!("mempool remains:{}", *remains);
+        }
         Reusable::new(self, self.objects
             .lock()
             .pop().unwrap())
@@ -112,8 +120,14 @@ impl<T> MemoryPool<T> {
 
     #[inline]
     pub fn attach(&self, t: T) {
-        self.objects.lock().push(t);
+        { self.objects.lock().push(t); }
         self.resources.0.send(());
+        {
+            let mut remains = self.remains.lock();
+            let remains = remains.deref_mut();
+            *remains += 1;
+            //println!("mempool remains:{}", *remains);
+        }
     }
 }
 
@@ -206,27 +220,27 @@ mod tests {
             thread::sleep(std::time::Duration::from_secs(1));
 
         });
-    let t2 = thread::spawn(move ||{
-        println!(">>>wait for 2.5s");
-        thread::sleep(std::time::Duration::from_millis(2500));
-        println!(">>>try to retain 1.....");
-        let object2 = pool2.pull();
-        println!(">>>retained 1");
-        println!(">>>try to retain 2.....");
-        let object2 = pool2.pull();
-        println!(">>>retained 1");
-        println!(">>>try to retain 3.....");
-        let object2 = pool2.pull();
-        println!(">>>retained 1");
+        let t2 = thread::spawn(move ||{
+            println!(">>>wait for 2.5s");
+            thread::sleep(std::time::Duration::from_millis(2500));
+            println!(">>>try to retain 1.....");
+            let object2 = pool2.pull();
+            println!(">>>retained 1");
+            println!(">>>try to retain 2.....");
+            let object2 = pool2.pull();
+            println!(">>>retained 1");
+            println!(">>>try to retain 3.....");
+            let object2 = pool2.pull();
+            println!(">>>retained 1");
 
-        thread::sleep(std::time::Duration::from_secs(1));
+            thread::sleep(std::time::Duration::from_secs(1));
 
-        println!(">>>dropped");
-        drop(object2);
-        thread::sleep(std::time::Duration::from_secs(1));
+            println!(">>>dropped");
+            drop(object2);
+            thread::sleep(std::time::Duration::from_secs(1));
 
-    });
-    t1.join();
+        });
+        t1.join();
         t2.join();
 
     }
