@@ -52,9 +52,9 @@
 //! or any other equivalent for the object that you are using, after pulling from the pool
 //!
 //! [`std::sync::Arc`]: https://doc.rust-lang.org/stable/std/sync/struct.Arc.html
-mod multi_buf;
+mod multi_buf ;
 
-
+pub use multi_buf::MultiBuffer;
 use crossbeam::channel;
 use std::ops::{Deref, DerefMut};
 use parking_lot::{Mutex,Condvar};
