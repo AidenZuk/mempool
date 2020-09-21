@@ -150,16 +150,22 @@ impl<T> MemoryPool<T> {
 
     fn start_wakeup(&self){
         self.resources.1.recv();
+        println!("start wakeup");
     }
 
     pub fn end_wakeup(&self) {
         self.resources.0.send(());
+        println!("end wakeup");
     }
     pub fn get_item_no_lock(&self)->Option<Reusable<T>> {
+        println!("lock....");
         let _x = self.run_block.lock();
+        println!("lock over....");
         if let Some(item) = self.objects.lock().pop() {
+            println!("objects lock. over...");
             Some(Reusable::new(self,item))
         }else{
+            println!("objects lock. no item...");
             None
         }
     }
@@ -173,23 +179,38 @@ impl<T> MemoryPool<T> {
 
     #[inline]
     pub fn attach(&self, t: T) {
-        let _x = self.run_block.lock();
-        println!("recyled an item ");
+        //let _x = self.run_block.lock();
+        println!("attach started<<<<<<<<<<<<<<<<>>>>>>>>>>>>>>>>");
+        self.start_wakeup();
         { self.objects.lock().push(t); }
+        println!("recyled an item ");
         let mut wait_list = self.waiting.lock();
+        println!("check waiting list ok ");
         if wait_list.len() > 0 {
             if self.len() >= wait_list[0].min_request {
-                let item = wait_list.pop().unwrap();
-                self.start_wakeup();
-                println!("waking up now.... ");
-                item.notifier.send(()).unwrap();
+                println!("remove ok<<<<<<<<<<<<<<<,, ");
+                let item = wait_list.remove(0);
+                println!("start wakeup<<<<<<<<<<<<<<<<<<<");
+                //&wait_list.remove(0);
+
+                println!("free cnts:{}, waking up  {}/ with min req:{} now.... ",self.len(),item.id.clone(),item.min_request);
+
+                thread::spawn(move||{
+                    item.notifier.send(()).unwrap();
+                });
+            }else{
+                self.end_wakeup();
             }
         }else {
             println!("pending data ");
             if let Some(pending_item) = self.pending.lock().pop() {
-                pending_item.notifier.send(());
+                thread::spawn(move|| {
+                    pending_item.notifier.send(());
+                });
             }
+            self.end_wakeup();
         }
+        println!("attach finished<<<<<<<<<<<<<<<<>>>>>>>>>>>>>>>>");
     }
 }
 
