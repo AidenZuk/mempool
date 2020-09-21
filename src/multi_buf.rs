@@ -6,7 +6,32 @@ use std::thread;
 use crate::{Reusable,MemoryPool};
 use crossbeam::crossbeam_channel;
 const ENV_MEMORY_CACHE: &str = "FIL_PROOFS_MEMORY_CACHE_PATH";
+macro_rules! prefetch {
+    ($val:expr) => {
+        #[cfg(any(target_arch = "x86_64", target_arch = "x86"))]
+        unsafe {
+            #[cfg(target_arch = "x86")]
+            use std::arch::x86::*;
+            #[cfg(target_arch = "x86_64")]
+            use std::arch::x86_64::*;
 
+            _mm_prefetch($val, _MM_HINT_T2);
+        }
+    };
+}
+macro_rules! prefetchl0 {
+    ($val:expr) => {
+        #[cfg(any(target_arch = "x86_64", target_arch = "x86"))]
+        unsafe {
+            #[cfg(target_arch = "x86")]
+            use std::arch::x86::*;
+            #[cfg(target_arch = "x86_64")]
+            use std::arch::x86_64::*;
+
+            _mm_prefetch($val, _MM_HINT_T0);
+        }
+    };
+}
 pub struct MultiBuffer<'a> {
     seg_exp: u8,
     seg_len: usize,
@@ -30,18 +55,28 @@ use std::fs::OpenOptions;
 use std::io::Read;
 use std::path::PathBuf;
 use std::process::Command;
-
+const NODE_SIZE:usize = 32;
+impl<'a> Drop for MultiBuffer<'a> {
+    fn drop(&mut self){
+        Command::new("mkdir")
+            .arg("-p")
+            .arg(&self.path_parent.parent().unwrap().to_path_buf())
+            .output()
+            .expect("failed to create cache path");
+    }
+}
 impl<'a> MultiBuffer<'a> {
     pub fn new(seg_exp: u8,id:&str,mem_pool:&'a MemoryPool<Vec<u8>>) -> Self {
 
         let seg_len = (1 << seg_exp);
-        let path_parent = if let Ok(path_cache) = env::var(ENV_MEMORY_CACHE){
-            PathBuf::from(path_cache).join(id)
+        let mut path_parent = if let Ok(path_cache) = env::var(ENV_MEMORY_CACHE){
+            PathBuf::from(path_cache)
         }else if let Ok(path_cache) = env::var("TMPDIR"){
-            PathBuf::from(path_cache).join(id)
+            PathBuf::from(path_cache)
         }else{
-            PathBuf::from("/var/tmp").join(id)
+            PathBuf::from("/var/tmp")
         };
+        path_parent = path_parent.join("mem_cache").join(id);
         Command::new("mkdir")
             .arg("-p")
             .arg(&path_parent)
@@ -66,6 +101,29 @@ impl<'a> MultiBuffer<'a> {
                 std::ptr::copy_nonoverlapping(buffer.as_ptr(), (&mut target[start..start + self.seg_len]).as_mut_ptr(), self.seg_len);
                 //( &mut target[start..start+self.seg_len]).clone_from_slice(buffer)
             }
+        }
+    }
+    pub fn read_index(&self,i: usize, parents: &[u32]) -> & [u8] {
+        let start = parents[i] as usize * NODE_SIZE;
+        let len =  NODE_SIZE;
+        if (start >= self.total_len) || (start + len > self.total_len) {
+            panic!(anyhow!("error in data len"))
+        } else {
+            let mut start_seg = start >> self.seg_exp;
+            let end_seg = (start + len - 1) >> self.seg_exp;
+            let seg_offset = start & (self.seg_len_mask);
+            unsafe {
+                if start_seg == end_seg {
+                    //std::ptr::copy_nonoverlapping((&self.buffers[start_seg][seg_offset..seg_offset + len]).as_ptr(), target[..].as_mut_ptr(), len);
+//                    (&mut target[..len]).clone_from_slice(&self.buffers[start_seg][seg_offset..seg_offset+len]);
+                    &self.buffers[start_seg][seg_offset..seg_offset+len]
+                } else {
+
+                    panic!(anyhow!("this should be in same seg"));
+                }
+            }
+
+
         }
     }
     pub fn read(&self, start: usize, len: usize, target: &mut [u8]) -> Result<()> {
@@ -138,9 +196,9 @@ impl<'a> MultiBuffer<'a> {
         }
     }
     pub fn write(&mut self, start: usize, len: usize, source: &[u8]) -> Result<()> {
-        if len == 1 {
-            println!("???")
-        }
+        // if len == 1 {
+        //     println!("???")
+        // }
         if source.len() != len {
             return Err(anyhow!("error in source size:{}/{}",len,source.len()));
         }
@@ -214,21 +272,39 @@ impl<'a> MultiBuffer<'a> {
         }
         self.store_files.clear();
     }
-    // #[inline]
-    // pub fn prefetch(&self, parents: &[u32]) {
-    //     for parent in parents {
-    //         let start = *parent as usize * NODE_SIZE;
-    //         if self.total_len <= start {
-    //             continue;
-    //         }
-    //
-    //         let start_seg = start >> self.seg_exp;
-    //         let offset = (start & self.seg_len_mask);
-    //         prefetch!(self.buffers[start_seg][offset..offset + NODE_SIZE].as_ptr() as *const i8);
-    //     }
-    // }
-}
 
+    #[inline]
+    pub fn prefetch(&self, parents: &[u32]) {
+        for parent in parents {
+            let start = *parent as usize * NODE_SIZE;
+            if self.total_len <= start {
+                continue;
+            }
+
+            let start_seg = start >> self.seg_exp;
+            let offset = (start & self.seg_len_mask);
+            prefetchl0!(self.buffers[start_seg][offset..offset + NODE_SIZE].as_ptr() as *const i8);
+        }
+    }
+}
+pub trait GetSegs<T>{
+    fn get_buffers(&self)->Vec<(& Vec<u8>,usize)>;
+}
+impl<'a> GetSegs<u8> for MultiBuffer<'a> {
+    fn get_buffers(&self)->Vec<(&Vec<u8>,usize)>{
+        let mut result = Vec::new();
+        let total_segs = self.buffers.len()-1;
+        let last_len = self.total_len - self.seg_len * (total_segs);
+        for(i,val) in self.buffers.iter().enumerate() {
+            if i != total_segs {
+                result.push((val.deref(),self.seg_len))
+            }else{
+                result.push((val.deref(),last_len))
+            }
+        }
+        result
+    }
+}
 
 #[cfg(test)]
 mod Tests {
