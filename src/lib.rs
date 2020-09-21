@@ -52,6 +52,9 @@
 //! or any other equivalent for the object that you are using, after pulling from the pool
 //!
 //! [`std::sync::Arc`]: https://doc.rust-lang.org/stable/std/sync/struct.Arc.html
+mod multi_buf;
+
+
 use crossbeam::channel;
 use std::ops::{Deref, DerefMut};
 use parking_lot::{Mutex,Condvar};
@@ -59,12 +62,32 @@ use std::mem::{ManuallyDrop, forget};
 use std::sync::Arc;
 use std::thread;
 
+
+use parking_lot::lock_api::MutexGuard;
+
 pub type Stack<T> = Vec<T>;
 
+pub struct PendingInfo{
+    id:String,
+    notifier:channel::Sender<()>,
+}
+
+pub struct WaitingInfo{
+    id:String,
+    //发送恢复命令
+    notifier:channel::Sender<()>,
+    ///最低需要多少个内存单元才能恢复
+    min_request:usize,
+}
 pub struct MemoryPool<T> {
-    objects:Mutex<Stack<T>>,
+    objects:Arc<Mutex<Stack<T>>>,
     resources:(channel::Sender<()>,channel::Receiver<()>),
-    remains:Arc<Mutex<usize>>,
+    run_block:Arc<Mutex<bool>>,
+    // the one wait for data
+    pending:Arc<Mutex<Vec<PendingInfo>>>,
+    ///those who is sleeping
+    waiting:Arc<Mutex<Vec<WaitingInfo>>>,
+
 }
 
 impl<T> MemoryPool<T> {
@@ -79,16 +102,17 @@ impl<T> MemoryPool<T> {
             objects.push(init());
         }
        // println!("mempool remains:{}", cap);
+
         MemoryPool {
-            objects: Mutex::new(objects),
+            objects: Arc::new(Mutex::new(objects)),
+            run_block:Arc::new(Mutex::new(false)),
             resources: {
                 let res = channel::unbounded();
-                for i in 0..cap{
-                    res.0.send(());
-                }
+                res.0.send(());
                 res
             },
-            remains:Arc::new(Mutex::new(cap)),
+            pending:Arc::new(Mutex::new(Vec::new())),
+            waiting:Arc::new(Mutex::new(Vec::new())),
         }
     }
 
@@ -102,31 +126,69 @@ impl<T> MemoryPool<T> {
         self.objects.lock().is_empty()
     }
 
-
     #[inline]
-    pub fn pull(&self ) -> Reusable<T> {
-        self.resources.1.recv().unwrap();
-        {
-            let mut remains = self.remains.lock();
-            let remains = remains.deref_mut();
-            *remains -= 1;
-           // println!("mempool remains:{}", *remains);
+    pub fn pending(&self,str:&str,sender:channel::Sender<()>) ->bool {
+       let _x = self.run_block.lock();
+       let can_pending = self.pending.lock().len() == 0;
+        if can_pending {
+            self.pending.lock().push(PendingInfo{
+                id:String::from(str),
+                notifier:sender.clone()
+            });
         }
-        Reusable::new(self, self.objects
-            .lock()
-            .pop().unwrap())
-
+        can_pending
     }
+    #[inline]
+    pub fn start_sleep(&self,id:String,min_req:usize,notifier:channel::Sender<()>){
+        let _x = self.run_block.lock();
+        self.waiting.lock().push(WaitingInfo{
+            id:id.clone(),
+            notifier,
+            min_request:min_req
+        })
+    }
+
+    fn start_wakeup(&self){
+        self.resources.1.recv();
+    }
+
+    pub fn end_wakeup(&self) {
+        self.resources.0.send(());
+    }
+    pub fn get_item_no_lock(&self)->Option<Reusable<T>> {
+        let _x = self.run_block.lock();
+        if let Some(item) = self.objects.lock().pop() {
+            Some(Reusable::new(self,item))
+        }else{
+            None
+        }
+    }
+    pub fn get_item(&self) ->Option<Reusable<T>> {
+        self.resources.1.recv();
+        let val = self.get_item_no_lock();
+        self.resources.0.send(());
+        val
+    }
+
 
     #[inline]
     pub fn attach(&self, t: T) {
+        let _x = self.run_block.lock();
+        println!("recyled an item ");
         { self.objects.lock().push(t); }
-        self.resources.0.send(());
-        {
-            let mut remains = self.remains.lock();
-            let remains = remains.deref_mut();
-            *remains += 1;
-            //println!("mempool remains:{}", *remains);
+        let mut wait_list = self.waiting.lock();
+        if wait_list.len() > 0 {
+            if self.len() >= wait_list[0].min_request {
+                let item = wait_list.pop().unwrap();
+                self.start_wakeup();
+                println!("waking up now.... ");
+                item.notifier.send(()).unwrap();
+            }
+        }else {
+            println!("pending data ");
+            if let Some(pending_item) = self.pending.lock().pop() {
+                pending_item.notifier.send(());
+            }
         }
     }
 }
@@ -190,60 +252,60 @@ mod tests {
     use std::thread;
     use std::sync::Arc;
 
-    #[test]
-    fn pull() {
-        let pool = Arc::new(MemoryPool::<Vec<u8>>::new(3, || Vec::new()));
-        let pool2 = pool.clone();
-        let t1 = thread::spawn(move ||{
-            let object1 = pool.pull();
-            println!("retain 1");
-            thread::sleep(std::time::Duration::from_secs(1));
-
-            let object2 = pool.pull();
-            println!("retain 2");
-            thread::sleep(std::time::Duration::from_secs(1));
-
-            let object3 = pool.pull();
-            println!("retain 3");
-            thread::sleep(std::time::Duration::from_secs(1));
-
-            println!("drop 1");
-            drop(object1);
-            thread::sleep(std::time::Duration::from_secs(1));
-
-            println!("drop 2");
-            drop(object2);
-            thread::sleep(std::time::Duration::from_secs(1));
-
-            println!("drop 3");
-            drop(object3);
-            thread::sleep(std::time::Duration::from_secs(1));
-
-        });
-        let t2 = thread::spawn(move ||{
-            println!(">>>wait for 2.5s");
-            thread::sleep(std::time::Duration::from_millis(2500));
-            println!(">>>try to retain 1.....");
-            let object2 = pool2.pull();
-            println!(">>>retained 1");
-            println!(">>>try to retain 2.....");
-            let object2 = pool2.pull();
-            println!(">>>retained 1");
-            println!(">>>try to retain 3.....");
-            let object2 = pool2.pull();
-            println!(">>>retained 1");
-
-            thread::sleep(std::time::Duration::from_secs(1));
-
-            println!(">>>dropped");
-            drop(object2);
-            thread::sleep(std::time::Duration::from_secs(1));
-
-        });
-        t1.join();
-        t2.join();
-
-    }
+    // #[test]
+    // fn pull() {
+    //     let pool = Arc::new(MemoryPool::<Vec<u8>>::new(3, || Vec::new()));
+    //     let pool2 = pool.clone();
+    //     let t1 = thread::spawn(move ||{
+    //         let object1 = pool.lock().pull();
+    //         println!("retain 1");
+    //         thread::sleep(std::time::Duration::from_secs(1));
+    //
+    //         let object2 = pool.pull();
+    //         println!("retain 2");
+    //         thread::sleep(std::time::Duration::from_secs(1));
+    //
+    //         let object3 = pool.pull();
+    //         println!("retain 3");
+    //         thread::sleep(std::time::Duration::from_secs(1));
+    //
+    //         println!("drop 1");
+    //         drop(object1);
+    //         thread::sleep(std::time::Duration::from_secs(1));
+    //
+    //         println!("drop 2");
+    //         drop(object2);
+    //         thread::sleep(std::time::Duration::from_secs(1));
+    //
+    //         println!("drop 3");
+    //         drop(object3);
+    //         thread::sleep(std::time::Duration::from_secs(1));
+    //
+    //     });
+    //     let t2 = thread::spawn(move ||{
+    //         println!(">>>wait for 2.5s");
+    //         thread::sleep(std::time::Duration::from_millis(2500));
+    //         println!(">>>try to retain 1.....");
+    //         let object2 = pool2.pull();
+    //         println!(">>>retained 1");
+    //         println!(">>>try to retain 2.....");
+    //         let object2 = pool2.pull();
+    //         println!(">>>retained 1");
+    //         println!(">>>try to retain 3.....");
+    //         let object2 = pool2.pull();
+    //         println!(">>>retained 1");
+    //
+    //         thread::sleep(std::time::Duration::from_secs(1));
+    //
+    //         println!(">>>dropped");
+    //         drop(object2);
+    //         thread::sleep(std::time::Duration::from_secs(1));
+    //
+    //     });
+    //     t1.join();
+    //     t2.join();
+    //
+    // }
 
     #[test]
     fn e2e() {
