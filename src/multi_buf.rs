@@ -3,8 +3,9 @@ use anyhow::{*, Result};
 
 use std::env;
 use std::thread;
-use crate::{Reusable,MemoryPool};
+use crate::{Reusable, MemoryPool};
 use crossbeam::crossbeam_channel;
+
 const ENV_MEMORY_CACHE: &str = "FIL_PROOFS_MEMORY_CACHE_PATH";
 macro_rules! prefetch {
     ($val:expr) => {
@@ -35,14 +36,14 @@ macro_rules! prefetchl0 {
 pub struct MultiBuffer<'a> {
     seg_exp: u8,
     seg_len: usize,
-    seg_len_mask:usize,
+    seg_len_mask: usize,
     //fast calculation
-    buffers: Vec<Reusable<'a,Vec<u8>>>,
+    buffers: Vec<Reusable<'a, Vec<u8>>>,
     total_len: usize,
-    mem_pool:&'a MemoryPool<Vec<u8>>,
-    id:String,
-    store_files:Vec<PathBuf>,
-    path_parent:PathBuf
+    mem_pool: &'a MemoryPool<Vec<u8>>,
+    id: String,
+    store_files: Vec<PathBuf>,
+    path_parent: PathBuf,
 }
 
 // use storage_proofs_core::{
@@ -55,9 +56,11 @@ use std::fs::OpenOptions;
 use std::io::Read;
 use std::path::PathBuf;
 use std::process::Command;
-const NODE_SIZE:usize = 32;
+
+const NODE_SIZE: usize = 32;
+
 impl<'a> Drop for MultiBuffer<'a> {
-    fn drop(&mut self){
+    fn drop(&mut self) {
         Command::new("mkdir")
             .arg("-p")
             .arg(&self.path_parent.parent().unwrap().to_path_buf())
@@ -65,15 +68,15 @@ impl<'a> Drop for MultiBuffer<'a> {
             .expect("failed to create cache path");
     }
 }
-impl<'a> MultiBuffer<'a> {
-    pub fn new(seg_exp: u8,id:&str,mem_pool:&'a MemoryPool<Vec<u8>>) -> Self {
 
+impl<'a> MultiBuffer<'a> {
+    pub fn new(seg_exp: u8, id: &str, mem_pool: &'a MemoryPool<Vec<u8>>) -> Self {
         let seg_len = (1 << seg_exp);
-        let mut path_parent = if let Ok(path_cache) = env::var(ENV_MEMORY_CACHE){
+        let mut path_parent = if let Ok(path_cache) = env::var(ENV_MEMORY_CACHE) {
             PathBuf::from(path_cache)
-        }else if let Ok(path_cache) = env::var("TMPDIR"){
+        } else if let Ok(path_cache) = env::var("TMPDIR") {
             PathBuf::from(path_cache)
-        }else{
+        } else {
             PathBuf::from("/var/tmp")
         };
         path_parent = path_parent.join("mem_cache").join(id);
@@ -85,13 +88,13 @@ impl<'a> MultiBuffer<'a> {
         MultiBuffer {
             seg_exp,
             seg_len,
-            seg_len_mask:seg_len-1,
+            seg_len_mask: seg_len - 1,
             buffers: Vec::new(),
             total_len: 0,
             mem_pool,
-            id:String::from(id),
+            id: String::from(id),
             path_parent,
-            store_files:Vec::new(),
+            store_files: Vec::new(),
         }
     }
     pub fn copy_to_slice(&self, target: &mut [u8]) {
@@ -103,9 +106,9 @@ impl<'a> MultiBuffer<'a> {
             }
         }
     }
-    pub fn read_index(&self,i: usize, parents: &[u32]) -> & [u8] {
+    pub fn read_index(&self, i: usize, parents: &[u32]) -> &[u8] {
         let start = parents[i] as usize * NODE_SIZE;
-        let len =  NODE_SIZE;
+        let len = NODE_SIZE;
         if (start >= self.total_len) || (start + len > self.total_len) {
             panic!(anyhow!("error in data len"))
         } else {
@@ -116,14 +119,11 @@ impl<'a> MultiBuffer<'a> {
                 if start_seg == end_seg {
                     //std::ptr::copy_nonoverlapping((&self.buffers[start_seg][seg_offset..seg_offset + len]).as_ptr(), target[..].as_mut_ptr(), len);
 //                    (&mut target[..len]).clone_from_slice(&self.buffers[start_seg][seg_offset..seg_offset+len]);
-                    &self.buffers[start_seg][seg_offset..seg_offset+len]
+                    &self.buffers[start_seg][seg_offset..seg_offset + len]
                 } else {
-
                     panic!(anyhow!("this should be in same seg"));
                 }
             }
-
-
         }
     }
     pub fn read(&self, start: usize, len: usize, target: &mut [u8]) -> Result<()> {
@@ -158,41 +158,42 @@ impl<'a> MultiBuffer<'a> {
             Ok(())
         }
     }
-    fn get_memory(&mut self){
-        if let Some(item) = self.mem_pool.get_item(){
-            println!("{} get an item,left:{}",self.id.clone(),self.mem_pool.len());
+    fn get_memory(&mut self) {
+        let (sender, receiver) = crossbeam_channel::unbounded();
+        let (item, should_sleep) = self.mem_pool.pending(&self.id, sender.clone());
+
+        if let Some(item) = item {
+            println!("{} get an item,left:{}", self.id.clone(), self.mem_pool.len());
             self.buffers.push(item);
-        }else{
-            let (sender,receiver) = crossbeam_channel::unbounded();
-            if self.mem_pool.pending(&self.id,sender.clone()){
-                println!("{} pending an item ",self.id.clone());
-                receiver.recv().unwrap();
-                println!("{} pending finished ",self.id.clone());
-                self.buffers.push(self.mem_pool.get_item().unwrap());
-            }else{
-
-                let min_req = self.buffers.len() + 1;
-                println!("{} sleep with min_req:{} ",self.id.clone(),min_req);
-                //通知mem pool 我自觉释放了
-                self.mem_pool.start_sleep((&self).id.clone(),min_req,sender.clone());
-                //休眠
-                self.sleep();
-                //等待允许启动
-
-                let _result = receiver.recv().unwrap();
-                println!("{} awake now min_req:{} ",self.id.clone(),min_req);
-                //获取内存
-                for i in 0..min_req {
-                    println!("{} getting memory:{} ",self.id.clone(),i);
-                    self.buffers.push(self.mem_pool.get_item_no_lock().unwrap())
-                }
-                println!("{} waked up with min_req:{} ",self.id.clone(),min_req);
-                self.mem_pool.end_wakeup();
-                //恢复
-                self.wakeup();
-                println!("{} waked up !!!! ",self.id.clone());
-
+        } else if !should_sleep {
+            println!("{} pending an item ", self.id.clone());
+            receiver.recv().unwrap();
+            println!("{} pending finished ", self.id.clone());
+            self.buffers.push(self.mem_pool.get_item().unwrap());
+        } else {
+            let min_req = self.buffers.len() + 1;
+            println!("{} sleep with min_req:{} ", self.id.clone(), min_req);
+            //通知mem pool 我自觉释放了
+            self.mem_pool.start_sleep((&self).id.clone(), min_req, sender.clone());
+            println!("{} starting sleep:{} ", self.id.clone(), min_req);
+            //休眠
+            self.sleep();
+            //通知内存已经释放
+            self.mem_pool.sleep_ok();
+            println!("{} sleeped ok:{} ", self.id.clone(), min_req);
+            //等待允许启动
+            let _result = receiver.recv().unwrap();
+            println!("{} awake now min_req:{} ", self.id.clone(), min_req);
+            //获取内存
+            for i in 0..min_req {
+                println!("{} getting memory:{} ", self.id.clone(), i);
+                self.buffers.push(self.mem_pool.get_item_no_lock().unwrap())
             }
+            println!("{} waked up with min_req:{} ", self.id.clone(), min_req);
+            self.mem_pool.end_wakeup();
+            //恢复
+            self.wakeup();
+            println!("{} waked up !!!! ", self.id.clone());
         }
     }
     pub fn write(&mut self, start: usize, len: usize, source: &[u8]) -> Result<()> {
@@ -241,33 +242,34 @@ impl<'a> MultiBuffer<'a> {
         self.total_len
     }
 
-    fn sleep(&mut self){
-        println!("{} sleeping with min_req:{}",self.id.clone(),&self.buffers.len() +1);
+    fn sleep(&mut self) {
+        println!("{} sleeping with min_req:{}", self.id.clone(), &self.buffers.len() + 1);
         self.store_files.clear();
-        for (i,val) in self.buffers.iter().enumerate(){
-            let file_name= self.path_parent.join( format!("cache_{}.dat",i));
-            fs::write(&file_name,val.deref());
+        for (i, val) in self.buffers.iter().enumerate() {
+            let file_name = self.path_parent.join(format!("cache_{}.dat", i));
+            fs::write(&file_name, val.deref());
             self.store_files.push((&file_name).clone());
             drop(val)
         }
         drop(&self.buffers);
         self.buffers = Vec::new();
+       // sleep(std::time::Duration::from_secs(3));
     }
-    fn wakeup(&mut self){
+    fn wakeup(&mut self) {
         let total_count = self.store_files.len();
-        println!("{} wake up with min_req:{}",self.id.clone(),total_count);
+        println!("{} wake up with min_req:{}", self.id.clone(), total_count);
         for file_id in 0..total_count {
-            let file_path= self.path_parent.join( format!("cache_{}.dat",file_id));
+            let file_path = self.path_parent.join(format!("cache_{}.dat", file_id));
             let mut open_option = OpenOptions::new();
 
             let data = self.buffers[file_id].deref_mut();
-            if let Ok(mut file) = open_option.read(true).open(&file_path){
+            if let Ok(mut file) = open_option.read(true).open(&file_path) {
                 file.read_to_end(data);
 
-                println!("remove mem cache file:{:?}",&file_path.display());
+                println!("remove mem cache file:{:?}", &file_path.display());
                 fs::remove_file(&file_path);
-            }else{
-                panic!("memory cache lost:{:?}",file_path.display())
+            } else {
+                panic!("memory cache lost:{:?}", file_path.display())
             }
         }
         self.store_files.clear();
@@ -287,19 +289,21 @@ impl<'a> MultiBuffer<'a> {
         }
     }
 }
-pub trait GetSegs<T>{
-    fn get_buffers(&self)->Vec<(& Vec<u8>,usize)>;
+
+pub trait GetSegs<T> {
+    fn get_buffers(&self) -> Vec<(&Vec<u8>, usize)>;
 }
+
 impl<'a> GetSegs<u8> for MultiBuffer<'a> {
-    fn get_buffers(&self)->Vec<(&Vec<u8>,usize)>{
+    fn get_buffers(&self) -> Vec<(&Vec<u8>, usize)> {
         let mut result = Vec::new();
-        let total_segs = self.buffers.len()-1;
+        let total_segs = self.buffers.len() - 1;
         let last_len = self.total_len - self.seg_len * (total_segs);
-        for(i,val) in self.buffers.iter().enumerate() {
+        for (i, val) in self.buffers.iter().enumerate() {
             if i != total_segs {
-                result.push((val.deref(),self.seg_len))
-            }else{
-                result.push((val.deref(),last_len))
+                result.push((val.deref(), self.seg_len))
+            } else {
+                result.push((val.deref(), last_len))
             }
         }
         result
@@ -314,13 +318,13 @@ mod Tests {
     use std::thread::sleep;
     use crate::MemoryPool;
     use lazy_static::lazy_static;
-    lazy_static!{
+    lazy_static! {
         pub static ref mem_pool:MemoryPool<Vec<u8>> = MemoryPool::new(4,||{vec![0u8;16]});
     }
 
     #[test]
     pub fn test_all_case() {
-        let mut buffers = MultiBuffer::new(4,"sector_1",&mem_pool);
+        let mut buffers = MultiBuffer::new(4, "sector_1", &mem_pool);
         assert_eq!(buffers.len(), 0);
         //write /read in first
         let test5_ele = vec![3, 5, 6, 7, 3];
@@ -341,12 +345,12 @@ mod Tests {
         buffers.read(19, 30, &mut out[..]);
         assert_eq!(test30_ele, out)
     }
+
     #[test]
     pub fn test_sleep() {
         rayon::scope(|s| {
-
-            s.spawn(|_s|{
-                let mut buffers = MultiBuffer::new(4,"sector_1",&mem_pool);
+            s.spawn(|_s| {
+                let mut buffers = MultiBuffer::new(4, "sector_1", &mem_pool);
                 // 16 * 2
                 assert_eq!(buffers.len(), 0);
                 //write /read in first
@@ -362,11 +366,10 @@ mod Tests {
                 let test5_ele = vec![3, 5, 6, 7, 3];
                 buffers.write(32, 5, &test5_ele[..]);
                 assert_eq!(buffers.len(), 48);
-
             });
 
-            s.spawn(|_s|{
-                let mut buffers = MultiBuffer::new(4,"sector_2",&mem_pool);
+            s.spawn(|_s| {
+                let mut buffers = MultiBuffer::new(4, "sector_2", &mem_pool);
                 // 16 * 2
                 assert_eq!(buffers.len(), 0);
                 //write /read in first
@@ -384,8 +387,8 @@ mod Tests {
                 assert_eq!(buffers.len(), 48);
             });
 
-            s.spawn(|_s|{
-                let mut buffers = MultiBuffer::new(4,"sector_3",&mem_pool);
+            s.spawn(|_s| {
+                let mut buffers = MultiBuffer::new(4, "sector_3", &mem_pool);
                 // 16 * 2
                 assert_eq!(buffers.len(), 0);
                 //write /read in first
@@ -402,8 +405,8 @@ mod Tests {
                 buffers.write(32, 5, &test5_ele[..]);
                 assert_eq!(buffers.len(), 48);
             });
-            s.spawn(|_s|{
-                let mut buffers = MultiBuffer::new(4,"sector_4",&mem_pool);
+            s.spawn(|_s| {
+                let mut buffers = MultiBuffer::new(4, "sector_4", &mem_pool);
                 // 16 * 2
                 assert_eq!(buffers.len(), 0);
                 //write /read in first
@@ -420,8 +423,8 @@ mod Tests {
                 buffers.write(32, 5, &test5_ele[..]);
                 assert_eq!(buffers.len(), 48);
             });
-            s.spawn(|_s|{
-                let mut buffers = MultiBuffer::new(4,"sector_5",&mem_pool);
+            s.spawn(|_s| {
+                let mut buffers = MultiBuffer::new(4, "sector_5", &mem_pool);
                 // 16 * 2
                 assert_eq!(buffers.len(), 0);
                 //write /read in first
@@ -438,8 +441,8 @@ mod Tests {
                 buffers.write(32, 5, &test5_ele[..]);
                 assert_eq!(buffers.len(), 48);
             });
-            s.spawn(|_s|{
-                let mut buffers = MultiBuffer::new(4,"sector_6",&mem_pool);
+            s.spawn(|_s| {
+                let mut buffers = MultiBuffer::new(4, "sector_6", &mem_pool);
                 // 16 * 2
                 assert_eq!(buffers.len(), 0);
                 //write /read in first
@@ -456,8 +459,8 @@ mod Tests {
                 buffers.write(32, 5, &test5_ele[..]);
                 assert_eq!(buffers.len(), 48);
             });
-            s.spawn(|_s|{
-                let mut buffers = MultiBuffer::new(4,"sector_7",&mem_pool);
+            s.spawn(|_s| {
+                let mut buffers = MultiBuffer::new(4, "sector_7", &mem_pool);
                 // 16 * 2
                 assert_eq!(buffers.len(), 0);
                 //write /read in first
@@ -474,8 +477,8 @@ mod Tests {
                 buffers.write(32, 5, &test5_ele[..]);
                 assert_eq!(buffers.len(), 48);
             });
-            s.spawn(|_s|{
-                let mut buffers = MultiBuffer::new(4,"sector_8",&mem_pool);
+            s.spawn(|_s| {
+                let mut buffers = MultiBuffer::new(4, "sector_8", &mem_pool);
                 // 16 * 2
                 assert_eq!(buffers.len(), 0);
                 //write /read in first
@@ -492,8 +495,8 @@ mod Tests {
                 buffers.write(32, 5, &test5_ele[..]);
                 assert_eq!(buffers.len(), 48);
             });
-            s.spawn(|_s|{
-                let mut buffers = MultiBuffer::new(4,"sector_9",&mem_pool);
+            s.spawn(|_s| {
+                let mut buffers = MultiBuffer::new(4, "sector_9", &mem_pool);
                 // 16 * 2
                 assert_eq!(buffers.len(), 0);
                 //write /read in first
@@ -510,8 +513,8 @@ mod Tests {
                 buffers.write(32, 5, &test5_ele[..]);
                 assert_eq!(buffers.len(), 48);
             });
-            s.spawn(|_s|{
-                let mut buffers = MultiBuffer::new(4,"sector_10",&mem_pool);
+            s.spawn(|_s| {
+                let mut buffers = MultiBuffer::new(4, "sector_10", &mem_pool);
                 // 16 * 2
                 assert_eq!(buffers.len(), 0);
                 //write /read in first
@@ -528,8 +531,8 @@ mod Tests {
                 buffers.write(32, 5, &test5_ele[..]);
                 assert_eq!(buffers.len(), 48);
             });
-            s.spawn(|_s|{
-                let mut buffers = MultiBuffer::new(4,"sector_11",&mem_pool);
+            s.spawn(|_s| {
+                let mut buffers = MultiBuffer::new(4, "sector_11", &mem_pool);
                 // 16 * 2
                 assert_eq!(buffers.len(), 0);
                 //write /read in first
@@ -546,8 +549,8 @@ mod Tests {
                 buffers.write(32, 5, &test5_ele[..]);
                 assert_eq!(buffers.len(), 48);
             });
-            s.spawn(|_s|{
-                let mut buffers = MultiBuffer::new(4,"sector_12",&mem_pool);
+            s.spawn(|_s| {
+                let mut buffers = MultiBuffer::new(4, "sector_12", &mem_pool);
                 // 16 * 2
                 assert_eq!(buffers.len(), 0);
                 //write /read in first
@@ -564,8 +567,8 @@ mod Tests {
                 buffers.write(32, 5, &test5_ele[..]);
                 assert_eq!(buffers.len(), 48);
             });
-            s.spawn(|_s|{
-                let mut buffers = MultiBuffer::new(4,"sector_13",&mem_pool);
+            s.spawn(|_s| {
+                let mut buffers = MultiBuffer::new(4, "sector_13", &mem_pool);
                 // 16 * 2
                 assert_eq!(buffers.len(), 0);
                 //write /read in first
@@ -582,8 +585,8 @@ mod Tests {
                 buffers.write(32, 5, &test5_ele[..]);
                 assert_eq!(buffers.len(), 48);
             });
-            s.spawn(|_s|{
-                let mut buffers = MultiBuffer::new(4,"sector_14",&mem_pool);
+            s.spawn(|_s| {
+                let mut buffers = MultiBuffer::new(4, "sector_14", &mem_pool);
                 // 16 * 2
                 assert_eq!(buffers.len(), 0);
                 //write /read in first
@@ -600,8 +603,8 @@ mod Tests {
                 buffers.write(32, 5, &test5_ele[..]);
                 assert_eq!(buffers.len(), 48);
             });
-            s.spawn(|_s|{
-                let mut buffers = MultiBuffer::new(4,"sector_15",&mem_pool);
+            s.spawn(|_s| {
+                let mut buffers = MultiBuffer::new(4, "sector_15", &mem_pool);
                 // 16 * 2
                 assert_eq!(buffers.len(), 0);
                 //write /read in first
@@ -618,8 +621,8 @@ mod Tests {
                 buffers.write(32, 5, &test5_ele[..]);
                 assert_eq!(buffers.len(), 48);
             });
-            s.spawn(|_s|{
-                let mut buffers = MultiBuffer::new(4,"sector_16",&mem_pool);
+            s.spawn(|_s| {
+                let mut buffers = MultiBuffer::new(4, "sector_16", &mem_pool);
                 // 16 * 2
                 assert_eq!(buffers.len(), 0);
                 //write /read in first
@@ -636,8 +639,8 @@ mod Tests {
                 buffers.write(32, 5, &test5_ele[..]);
                 assert_eq!(buffers.len(), 48);
             });
-            s.spawn(|_s|{
-                let mut buffers = MultiBuffer::new(4,"sector_17",&mem_pool);
+            s.spawn(|_s| {
+                let mut buffers = MultiBuffer::new(4, "sector_17", &mem_pool);
                 // 16 * 2
                 assert_eq!(buffers.len(), 0);
                 //write /read in first
@@ -654,8 +657,8 @@ mod Tests {
                 buffers.write(32, 5, &test5_ele[..]);
                 assert_eq!(buffers.len(), 48);
             });
-            s.spawn(|_s|{
-                let mut buffers = MultiBuffer::new(4,"sector_18",&mem_pool);
+            s.spawn(|_s| {
+                let mut buffers = MultiBuffer::new(4, "sector_18", &mem_pool);
                 // 16 * 2
                 assert_eq!(buffers.len(), 0);
                 //write /read in first
@@ -672,8 +675,8 @@ mod Tests {
                 buffers.write(32, 5, &test5_ele[..]);
                 assert_eq!(buffers.len(), 48);
             });
-            s.spawn(|_s|{
-                let mut buffers = MultiBuffer::new(4,"sector_19",&mem_pool);
+            s.spawn(|_s| {
+                let mut buffers = MultiBuffer::new(4, "sector_19", &mem_pool);
                 // 16 * 2
                 assert_eq!(buffers.len(), 0);
                 //write /read in first
@@ -690,8 +693,8 @@ mod Tests {
                 buffers.write(32, 5, &test5_ele[..]);
                 assert_eq!(buffers.len(), 48);
             });
-            s.spawn(|_s|{
-                let mut buffers = MultiBuffer::new(4,"sector_20",&mem_pool);
+            s.spawn(|_s| {
+                let mut buffers = MultiBuffer::new(4, "sector_20", &mem_pool);
                 // 16 * 2
                 assert_eq!(buffers.len(), 0);
                 //write /read in first
@@ -709,23 +712,22 @@ mod Tests {
                 assert_eq!(buffers.len(), 48);
             });
         });
-
     }
+
     #[test]
     pub fn test_wait() {
-
         rayon::scope(|s| {
             for j in 0..100 as usize {
                 let i = j;
                 s.spawn(move |s| {
-                    let mut buffers = MultiBuffer::new(32,"sector_1",&mem_pool);
+                    let mut buffers = MultiBuffer::new(32, "sector_1", &mem_pool);
 
                     let mut rng = rand::thread_rng();
                     let y: f64 = rng.gen(); // generates a float between 0 and 1
                     sleep(std::time::Duration::from_millis((y * 10000.0) as u64));
                     println!("allocating:{}", i);
-                    let val = vec![0u8; 1<<32];
-                    buffers.write(0, 1<<32, &val[..]);
+                    let val = vec![0u8; 1 << 32];
+                    buffers.write(0, 1 << 32, &val[..]);
                     let mut rng = rand::thread_rng();
                     let y: f64 = rng.gen(); // generates a float between 0 and 1
                     sleep(std::time::Duration::from_millis((y * 10000.0) as u64));

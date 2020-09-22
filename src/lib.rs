@@ -82,6 +82,8 @@ pub struct WaitingInfo{
 pub struct MemoryPool<T> {
     objects:Arc<Mutex<Stack<T>>>,
     resources:(channel::Sender<()>,channel::Receiver<()>),
+
+    resources_judging:(channel::Sender<()>,channel::Receiver<()>),
     run_block:Arc<Mutex<bool>>,
     // the one wait for data
     pending:Arc<Mutex<Vec<PendingInfo>>>,
@@ -111,6 +113,11 @@ impl<T> MemoryPool<T> {
                 res.0.send(());
                 res
             },
+            resources_judging: {
+                let res = channel::unbounded();
+                res.0.send(());
+                res
+            },
             pending:Arc::new(Mutex::new(Vec::new())),
             waiting:Arc::new(Mutex::new(Vec::new())),
         }
@@ -127,16 +134,23 @@ impl<T> MemoryPool<T> {
     }
 
     #[inline]
-    pub fn pending(&self,str:&str,sender:channel::Sender<()>) ->bool {
-       let _x = self.run_block.lock();
-       let can_pending = self.pending.lock().len() == 0;
-        if can_pending {
+    pub fn pending(&self,str:&str,sender:channel::Sender<()>) ->(Option<Reusable<T>>,bool) {
+
+       self.resources_judging.1.recv().unwrap();
+        if let Some(item) = self.get_item() {
+            self.resources_judging.0.send(()).unwrap();
+            (Some(item),false)
+        }else if (self.pending.lock().len() == 0) {
             self.pending.lock().push(PendingInfo{
                 id:String::from(str),
                 notifier:sender.clone()
             });
+            self.resources_judging.0.send(()).unwrap();
+            (None,false)
+        }else{
+            (None,true)
         }
-        can_pending
+
     }
     #[inline]
     pub fn start_sleep(&self,id:String,min_req:usize,notifier:channel::Sender<()>){
@@ -147,7 +161,10 @@ impl<T> MemoryPool<T> {
             min_request:min_req
         })
     }
-
+    #[inline]
+    pub fn sleep_ok(&self){
+        self.resources_judging.0.send(()).unwrap();
+    }
     fn start_wakeup(&self){
         self.resources.1.recv();
         println!("start wakeup");
@@ -158,7 +175,7 @@ impl<T> MemoryPool<T> {
         println!("end wakeup");
     }
     pub fn get_item_no_lock(&self)->Option<Reusable<T>> {
-        println!("lock....");
+        println!("lock...");
         let _x = self.run_block.lock();
         println!("lock over....");
         if let Some(item) = self.objects.lock().pop() {
@@ -203,7 +220,8 @@ impl<T> MemoryPool<T> {
             }
         }else {
             println!("pending data ");
-            if let Some(pending_item) = self.pending.lock().pop() {
+            if self.pending.lock().len() >0 {
+                let pending_item = self.pending.lock().remove(0);
                 thread::spawn(move|| {
                     pending_item.notifier.send(());
                 });
