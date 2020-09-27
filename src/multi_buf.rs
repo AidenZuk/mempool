@@ -1,6 +1,6 @@
 use std::{vec, fs};
 use anyhow::{*, Result};
-
+use log::{info,trace};
 use std::env;
 use std::thread;
 use crate::{Reusable, MemoryPool};
@@ -58,7 +58,10 @@ use std::path::PathBuf;
 use std::process::Command;
 
 const NODE_SIZE: usize = 32;
-
+pub struct SEG_PT{
+    pub segment:u8,
+    pub offset:u32
+}
 impl<'a> Drop for MultiBuffer<'a> {
     fn drop(&mut self) {
         Command::new("mkdir")
@@ -106,26 +109,67 @@ impl<'a> MultiBuffer<'a> {
             }
         }
     }
-    pub fn read_index(&self, i: usize, parents: &[u32]) -> &[u8] {
+    pub fn buffers_mut(&mut self)->Vec <&mut Vec<u8>>{
+        let mut buf_items = Vec::with_capacity(self.buffers.len());
+         self.buffers.iter_mut().for_each( |item| {
+            buf_items.push(item.deref_mut());
+        });
+        buf_items
+    }
+
+    pub fn buffers(&self)->Vec <&Vec<u8>>{
+        let mut buf_items = Vec::with_capacity(self.buffers.len());
+        self.buffers.iter().for_each( |item| {
+            buf_items.push(item.deref());
+        });
+        buf_items
+    }
+    pub fn get_seg_exp(&self)->u8{
+        self.seg_exp
+    }
+    pub fn get_seg_len(&self)->usize{
+        self.seg_len
+    }
+    pub fn get_seg_mask(&self)->usize{
+        self.seg_len_mask
+    }
+    #[inline]
+    pub fn read_index_no_extend(&self, i: usize, parents: &[(u16,u32)]) -> &[u8] {
+
+        &self.buffers[parents[i].0  as usize ][parents[i].1 as usize ..parents[i].1 as usize + NODE_SIZE]
+    }
+    // pub fn read_indice(&mut self,parents: &[u32])->&[&'a [u8]]{
+    //
+    // }
+    #[inline]
+    pub fn read_index(&mut self, i: usize, parents: &[u32]) -> &[u8] {
         let start = parents[i] as usize * NODE_SIZE;
         let len = NODE_SIZE;
         if (start >= self.total_len) || (start + len > self.total_len) {
-            panic!(anyhow!("error in data len"))
-        } else {
-            let mut start_seg = start >> self.seg_exp;
-            let end_seg = (start + len - 1) >> self.seg_exp;
-            let seg_offset = start & (self.seg_len_mask);
-            unsafe {
-                if start_seg == end_seg {
-                    //std::ptr::copy_nonoverlapping((&self.buffers[start_seg][seg_offset..seg_offset + len]).as_ptr(), target[..].as_mut_ptr(), len);
+            //prepare buffer
+            //if start + len >= self.total_len {
+            //计算需要几个buffer
+            let buff_counts = ((start + len + self.seg_len - 1) >> self.seg_exp);
+            for _i in self.buffers.len()..buff_counts {
+                self.get_memory();
+            }
+            self.total_len = self.buffers.len() << self.seg_exp;
+            // }
+        }
+        let mut start_seg = start >> self.seg_exp;
+        let end_seg = (start + len - 1) >> self.seg_exp;
+        let seg_offset = start & (self.seg_len_mask);
+        unsafe {
+            if start_seg == end_seg {
+                //std::ptr::copy_nonoverlapping((&self.buffers[start_seg][seg_offset..seg_offset + len]).as_ptr(), target[..].as_mut_ptr(), len);
 //                    (&mut target[..len]).clone_from_slice(&self.buffers[start_seg][seg_offset..seg_offset+len]);
-                    &self.buffers[start_seg][seg_offset..seg_offset + len]
-                } else {
-                    panic!(anyhow!("this should be in same seg"));
-                }
+                &self.buffers[start_seg][seg_offset..seg_offset + len]
+            } else {
+                panic!(anyhow!("this should be in same seg"));
             }
         }
     }
+    #[inline]
     pub fn read(&self, start: usize, len: usize, target: &mut [u8]) -> Result<()> {
         if (start >= self.total_len) || (start + len > self.total_len) {
             Err(anyhow!("error in data len"))
@@ -158,44 +202,53 @@ impl<'a> MultiBuffer<'a> {
             Ok(())
         }
     }
+
     fn get_memory(&mut self) {
         let (sender, receiver) = crossbeam_channel::unbounded();
         let (item, should_sleep) = self.mem_pool.pending(&self.id, sender.clone());
 
         if let Some(item) = item {
-            println!("{} get an item,left:{}", self.id.clone(), self.mem_pool.len());
+            trace!("{} get an item,left:{}", self.id.clone(), self.mem_pool.len());
             self.buffers.push(item);
         } else if !should_sleep {
-            println!("{} pending an item ", self.id.clone());
+            trace!("{} pending an item ", self.id.clone());
             receiver.recv().unwrap();
-            println!("{} pending finished ", self.id.clone());
+            trace!("{} pending finished ", self.id.clone());
             self.buffers.push(self.mem_pool.get_item().unwrap());
         } else {
             let min_req = self.buffers.len() + 1;
-            println!("{} sleep with min_req:{} ", self.id.clone(), min_req);
+            trace!("{} sleep with min_req:{} ", self.id.clone(), min_req);
             //通知mem pool 我自觉释放了
             self.mem_pool.start_sleep((&self).id.clone(), min_req, sender.clone());
-            println!("{} starting sleep:{} ", self.id.clone(), min_req);
+            trace!("{} starting sleep:{} ", self.id.clone(), min_req);
             //休眠
             self.sleep();
             //通知内存已经释放
             self.mem_pool.sleep_ok();
-            println!("{} sleeped ok:{} ", self.id.clone(), min_req);
+            trace!("{} sleeped ok:{} ", self.id.clone(), min_req);
             //等待允许启动
             let _result = receiver.recv().unwrap();
-            println!("{} awake now min_req:{} ", self.id.clone(), min_req);
+            trace!("{} awake now min_req:{} ", self.id.clone(), min_req);
             //获取内存
             for i in 0..min_req {
-                println!("{} getting memory:{} ", self.id.clone(), i);
+                trace!("{} getting memory:{} ", self.id.clone(), i);
                 self.buffers.push(self.mem_pool.get_item_no_lock().unwrap())
             }
-            println!("{} waked up with min_req:{} ", self.id.clone(), min_req);
+            trace!("{} waked up with min_req:{} ", self.id.clone(), min_req);
             self.mem_pool.end_wakeup();
             //恢复
             self.wakeup();
-            println!("{} waked up !!!! ", self.id.clone());
+            trace!("{} waked up !!!! ", self.id.clone());
         }
     }
+    #[inline]
+    pub fn write_ensured(&mut self, start: usize, len: usize, source: &[u8])  {
+        unsafe {
+                std::ptr::copy_nonoverlapping((&source).as_ptr(), self.buffers[start >> self.seg_exp][start & (self.seg_len_mask)..].as_mut_ptr(), len);
+                //  &self.buffers[start_seg][seg_offset..seg_offset+len].clone_from_slice(&source[..len]);
+        }
+    }
+    #[inline]
     pub fn write(&mut self, start: usize, len: usize, source: &[u8]) -> Result<()> {
         // if len == 1 {
         //     println!("???")
@@ -242,8 +295,20 @@ impl<'a> MultiBuffer<'a> {
         self.total_len
     }
 
+    pub fn ensure(&mut self,len:usize) {
+        if  len > self.total_len {
+            //计算需要几个buffer
+            let buff_counts = ((len + self.seg_len - 1) >> self.seg_exp);
+            for _i in self.buffers.len()..buff_counts {
+                self.get_memory();
+            }
+
+            self.total_len = self.buffers.len() << self.seg_exp;
+          //  println!("total len is : {},and seg is:{}, with request:{}, seg_exp :{}",self.total_len,self.buffers.len(),len,self.seg_exp);
+        }
+    }
     fn sleep(&mut self) {
-        println!("{} sleeping with min_req:{}", self.id.clone(), &self.buffers.len() + 1);
+        trace!("{} sleeping with min_req:{}", self.id.clone(), &self.buffers.len() + 1);
         self.store_files.clear();
         for (i, val) in self.buffers.iter().enumerate() {
             let file_name = self.path_parent.join(format!("cache_{}.dat", i));
@@ -253,20 +318,22 @@ impl<'a> MultiBuffer<'a> {
         }
         drop(&self.buffers);
         self.buffers = Vec::new();
-       // sleep(std::time::Duration::from_secs(3));
+        // sleep(std::time::Duration::from_secs(3));
     }
     fn wakeup(&mut self) {
         let total_count = self.store_files.len();
-        println!("{} wake up with min_req:{}", self.id.clone(), total_count);
+        trace!("{} wake up with min_req:{}", self.id.clone(), total_count);
         for file_id in 0..total_count {
             let file_path = self.path_parent.join(format!("cache_{}.dat", file_id));
             let mut open_option = OpenOptions::new();
 
             let data = self.buffers[file_id].deref_mut();
             if let Ok(mut file) = open_option.read(true).open(&file_path) {
-                file.read_to_end(data);
+                let file_len = file.metadata().unwrap().len();
+                file.read_exact(&mut data[..file_len as usize]);
+                //file.read_to_end(data);
 
-                println!("remove mem cache file:{:?}", &file_path.display());
+                trace!("remove mem cache file:{:?}", &file_path.display());
                 fs::remove_file(&file_path);
             } else {
                 panic!("memory cache lost:{:?}", file_path.display())
@@ -276,17 +343,43 @@ impl<'a> MultiBuffer<'a> {
     }
 
     #[inline]
-    pub fn prefetch(&self, parents: &[u32]) {
+    pub fn prefetch(&self, parents: &[(u16,u32)]) {
         for parent in parents {
-            let start = *parent as usize * NODE_SIZE;
-            if self.total_len <= start {
-                continue;
-            }
-
-            let start_seg = start >> self.seg_exp;
-            let offset = (start & self.seg_len_mask);
-            prefetchl0!(self.buffers[start_seg][offset..offset + NODE_SIZE].as_ptr() as *const i8);
+            prefetchl0!(self.buffers[parent.0 as usize ][parent.1 as usize..parent.1 as usize + NODE_SIZE].as_ptr() as *const i8);
         }
+    }
+
+    pub fn load_from_file(&mut self, file_name: &PathBuf) -> usize {
+        let mut open_option = fs::OpenOptions::new();
+        let mut file = open_option.read(true).open(&file_name).unwrap();
+        let mut read_size = 0;
+        let total_size = file.metadata().unwrap().len() as usize;
+        if total_size >= self.total_len {
+            //计算需要几个buffer
+            let buff_counts = ((total_size + self.seg_len - 1) >> self.seg_exp);
+            for _i in self.buffers.len()..buff_counts {
+                self.get_memory();
+            }
+            self.total_len = self.buffers.len() << self.seg_exp;
+        }
+
+        let mut all_read_size = 0;
+        for i in 0..self.buffers.len() {
+            let mut cur_round_size = 0;
+            loop {
+                let mut read_size = file.read(&mut self.buffers[i][cur_round_size..]).unwrap();
+                cur_round_size += read_size;
+                all_read_size += read_size;
+                if cur_round_size >= self.seg_len || all_read_size >= total_size {
+                    break;
+                } else if read_size == 0 {
+                    panic!("read file failed :{} of {} read", all_read_size, total_size);
+                }
+            }
+        }
+
+
+        all_read_size
     }
 }
 
@@ -318,8 +411,9 @@ mod Tests {
     use std::thread::sleep;
     use crate::MemoryPool;
     use lazy_static::lazy_static;
+    const buf_len:usize = 1<<30;
     lazy_static! {
-        pub static ref mem_pool:MemoryPool<Vec<u8>> = MemoryPool::new(4,||{vec![0u8;16]});
+        pub static ref mem_pool:MemoryPool<Vec<u8>> = MemoryPool::new(4,||{vec![0u8;buf_len]});
     }
 
     #[test]
@@ -328,11 +422,11 @@ mod Tests {
         assert_eq!(buffers.len(), 0);
         //write /read in first
         let test5_ele = vec![3, 5, 6, 7, 3];
-        buffers.write(3, 5, &test5_ele[..]);
+        buffers.write(buf_len -5, 5, &test5_ele[..]);
 
-        assert_eq!(buffers.len(), 16);
+        assert_eq!(buffers.len(), buf_len);
         let mut out = vec![0u8; 5];
-        buffers.read(3, 5, &mut out[..]);
+        buffers.read(buf_len -5 , 5, &mut out[..]);
 
         assert_eq!(test5_ele, out);
 
@@ -349,368 +443,28 @@ mod Tests {
     #[test]
     pub fn test_sleep() {
         rayon::scope(|s| {
-            s.spawn(|_s| {
-                let mut buffers = MultiBuffer::new(4, "sector_1", &mem_pool);
-                // 16 * 2
-                assert_eq!(buffers.len(), 0);
-                //write /read in first
-                let test5_ele = vec![3, 5, 6, 7, 3];
-                buffers.write(4, 5, &test5_ele[..]);
-                assert_eq!(buffers.len(), 16);
-                //write /read in first
-                let test5_ele = vec![3, 5, 6, 7, 3];
-                buffers.write(16, 5, &test5_ele[..]);
-                assert_eq!(buffers.len(), 32);
-                sleep(time::Duration::from_secs(2));
+            for i in 0..20
+            {
+                s.spawn(move |_s| {
+                    let mut buffers = MultiBuffer::new(30, &format!("sector_{}",i), &mem_pool);
+                    // 16 * 2
+                    assert_eq!(buffers.len(), 0);
+                    //write /read in first
+                    let test5_ele = vec![3, 5, 6, 7, 3];
+                    buffers.write(buf_len - 5, 5, &test5_ele[..]);
+                    assert_eq!(buffers.len(), buf_len);
+                    //write /read in first
+                    let test5_ele = vec![3, 5, 6, 7, 3];
+                    buffers.write(buf_len, 5, &test5_ele[..]);
+                    assert_eq!(buffers.len(), buf_len * 2);
+                    sleep(time::Duration::from_secs(2));
 
-                let test5_ele = vec![3, 5, 6, 7, 3];
-                buffers.write(32, 5, &test5_ele[..]);
-                assert_eq!(buffers.len(), 48);
-            });
+                    let test5_ele = vec![3, 5, 6, 7, 3];
+                    buffers.write(buf_len * 2, 5, &test5_ele[..]);
+                    assert_eq!(buffers.len(), buf_len * 3);
+                });
+            }
 
-            s.spawn(|_s| {
-                let mut buffers = MultiBuffer::new(4, "sector_2", &mem_pool);
-                // 16 * 2
-                assert_eq!(buffers.len(), 0);
-                //write /read in first
-                let test5_ele = vec![3, 5, 6, 7, 3];
-                buffers.write(4, 5, &test5_ele[..]);
-                assert_eq!(buffers.len(), 16);
-                //write /read in first
-                let test5_ele = vec![3, 5, 6, 7, 3];
-                buffers.write(16, 5, &test5_ele[..]);
-                assert_eq!(buffers.len(), 32);
-                sleep(time::Duration::from_secs(3));
-
-                let test5_ele = vec![3, 5, 6, 7, 3];
-                buffers.write(32, 5, &test5_ele[..]);
-                assert_eq!(buffers.len(), 48);
-            });
-
-            s.spawn(|_s| {
-                let mut buffers = MultiBuffer::new(4, "sector_3", &mem_pool);
-                // 16 * 2
-                assert_eq!(buffers.len(), 0);
-                //write /read in first
-                let test5_ele = vec![3, 5, 6, 7, 3];
-                buffers.write(4, 5, &test5_ele[..]);
-                assert_eq!(buffers.len(), 16);
-                //write /read in first
-                let test5_ele = vec![3, 5, 6, 7, 3];
-                buffers.write(16, 5, &test5_ele[..]);
-                assert_eq!(buffers.len(), 32);
-                sleep(time::Duration::from_secs(5));
-
-                let test5_ele = vec![3, 5, 6, 7, 3];
-                buffers.write(32, 5, &test5_ele[..]);
-                assert_eq!(buffers.len(), 48);
-            });
-            s.spawn(|_s| {
-                let mut buffers = MultiBuffer::new(4, "sector_4", &mem_pool);
-                // 16 * 2
-                assert_eq!(buffers.len(), 0);
-                //write /read in first
-                let test5_ele = vec![3, 5, 6, 7, 3];
-                buffers.write(4, 5, &test5_ele[..]);
-                assert_eq!(buffers.len(), 16);
-                //write /read in first
-                let test5_ele = vec![3, 5, 6, 7, 3];
-                buffers.write(16, 5, &test5_ele[..]);
-                assert_eq!(buffers.len(), 32);
-                sleep(time::Duration::from_secs(4));
-
-                let test5_ele = vec![3, 5, 6, 7, 3];
-                buffers.write(32, 5, &test5_ele[..]);
-                assert_eq!(buffers.len(), 48);
-            });
-            s.spawn(|_s| {
-                let mut buffers = MultiBuffer::new(4, "sector_5", &mem_pool);
-                // 16 * 2
-                assert_eq!(buffers.len(), 0);
-                //write /read in first
-                let test5_ele = vec![3, 5, 6, 7, 3];
-                buffers.write(4, 5, &test5_ele[..]);
-                assert_eq!(buffers.len(), 16);
-                //write /read in first
-                let test5_ele = vec![3, 5, 6, 7, 3];
-                buffers.write(16, 5, &test5_ele[..]);
-                assert_eq!(buffers.len(), 32);
-                sleep(time::Duration::from_secs(4));
-
-                let test5_ele = vec![3, 5, 6, 7, 3];
-                buffers.write(32, 5, &test5_ele[..]);
-                assert_eq!(buffers.len(), 48);
-            });
-            s.spawn(|_s| {
-                let mut buffers = MultiBuffer::new(4, "sector_6", &mem_pool);
-                // 16 * 2
-                assert_eq!(buffers.len(), 0);
-                //write /read in first
-                let test5_ele = vec![3, 5, 6, 7, 3];
-                buffers.write(4, 5, &test5_ele[..]);
-                assert_eq!(buffers.len(), 16);
-                //write /read in first
-                let test5_ele = vec![3, 5, 6, 7, 3];
-                buffers.write(16, 5, &test5_ele[..]);
-                assert_eq!(buffers.len(), 32);
-                sleep(time::Duration::from_secs(4));
-
-                let test5_ele = vec![3, 5, 6, 7, 3];
-                buffers.write(32, 5, &test5_ele[..]);
-                assert_eq!(buffers.len(), 48);
-            });
-            s.spawn(|_s| {
-                let mut buffers = MultiBuffer::new(4, "sector_7", &mem_pool);
-                // 16 * 2
-                assert_eq!(buffers.len(), 0);
-                //write /read in first
-                let test5_ele = vec![3, 5, 6, 7, 3];
-                buffers.write(4, 5, &test5_ele[..]);
-                assert_eq!(buffers.len(), 16);
-                //write /read in first
-                let test5_ele = vec![3, 5, 6, 7, 3];
-                buffers.write(16, 5, &test5_ele[..]);
-                assert_eq!(buffers.len(), 32);
-                sleep(time::Duration::from_secs(4));
-
-                let test5_ele = vec![3, 5, 6, 7, 3];
-                buffers.write(32, 5, &test5_ele[..]);
-                assert_eq!(buffers.len(), 48);
-            });
-            s.spawn(|_s| {
-                let mut buffers = MultiBuffer::new(4, "sector_8", &mem_pool);
-                // 16 * 2
-                assert_eq!(buffers.len(), 0);
-                //write /read in first
-                let test5_ele = vec![3, 5, 6, 7, 3];
-                buffers.write(4, 5, &test5_ele[..]);
-                assert_eq!(buffers.len(), 16);
-                //write /read in first
-                let test5_ele = vec![3, 5, 6, 7, 3];
-                buffers.write(16, 5, &test5_ele[..]);
-                assert_eq!(buffers.len(), 32);
-                sleep(time::Duration::from_secs(4));
-
-                let test5_ele = vec![3, 5, 6, 7, 3];
-                buffers.write(32, 5, &test5_ele[..]);
-                assert_eq!(buffers.len(), 48);
-            });
-            s.spawn(|_s| {
-                let mut buffers = MultiBuffer::new(4, "sector_9", &mem_pool);
-                // 16 * 2
-                assert_eq!(buffers.len(), 0);
-                //write /read in first
-                let test5_ele = vec![3, 5, 6, 7, 3];
-                buffers.write(4, 5, &test5_ele[..]);
-                assert_eq!(buffers.len(), 16);
-                //write /read in first
-                let test5_ele = vec![3, 5, 6, 7, 3];
-                buffers.write(16, 5, &test5_ele[..]);
-                assert_eq!(buffers.len(), 32);
-                sleep(time::Duration::from_secs(4));
-
-                let test5_ele = vec![3, 5, 6, 7, 3];
-                buffers.write(32, 5, &test5_ele[..]);
-                assert_eq!(buffers.len(), 48);
-            });
-            s.spawn(|_s| {
-                let mut buffers = MultiBuffer::new(4, "sector_10", &mem_pool);
-                // 16 * 2
-                assert_eq!(buffers.len(), 0);
-                //write /read in first
-                let test5_ele = vec![3, 5, 6, 7, 3];
-                buffers.write(4, 5, &test5_ele[..]);
-                assert_eq!(buffers.len(), 16);
-                //write /read in first
-                let test5_ele = vec![3, 5, 6, 7, 3];
-                buffers.write(16, 5, &test5_ele[..]);
-                assert_eq!(buffers.len(), 32);
-                sleep(time::Duration::from_secs(4));
-
-                let test5_ele = vec![3, 5, 6, 7, 3];
-                buffers.write(32, 5, &test5_ele[..]);
-                assert_eq!(buffers.len(), 48);
-            });
-            s.spawn(|_s| {
-                let mut buffers = MultiBuffer::new(4, "sector_11", &mem_pool);
-                // 16 * 2
-                assert_eq!(buffers.len(), 0);
-                //write /read in first
-                let test5_ele = vec![3, 5, 6, 7, 3];
-                buffers.write(4, 5, &test5_ele[..]);
-                assert_eq!(buffers.len(), 16);
-                //write /read in first
-                let test5_ele = vec![3, 5, 6, 7, 3];
-                buffers.write(16, 5, &test5_ele[..]);
-                assert_eq!(buffers.len(), 32);
-                sleep(time::Duration::from_secs(4));
-
-                let test5_ele = vec![3, 5, 6, 7, 3];
-                buffers.write(32, 5, &test5_ele[..]);
-                assert_eq!(buffers.len(), 48);
-            });
-            s.spawn(|_s| {
-                let mut buffers = MultiBuffer::new(4, "sector_12", &mem_pool);
-                // 16 * 2
-                assert_eq!(buffers.len(), 0);
-                //write /read in first
-                let test5_ele = vec![3, 5, 6, 7, 3];
-                buffers.write(4, 5, &test5_ele[..]);
-                assert_eq!(buffers.len(), 16);
-                //write /read in first
-                let test5_ele = vec![3, 5, 6, 7, 3];
-                buffers.write(16, 5, &test5_ele[..]);
-                assert_eq!(buffers.len(), 32);
-                sleep(time::Duration::from_secs(4));
-
-                let test5_ele = vec![3, 5, 6, 7, 3];
-                buffers.write(32, 5, &test5_ele[..]);
-                assert_eq!(buffers.len(), 48);
-            });
-            s.spawn(|_s| {
-                let mut buffers = MultiBuffer::new(4, "sector_13", &mem_pool);
-                // 16 * 2
-                assert_eq!(buffers.len(), 0);
-                //write /read in first
-                let test5_ele = vec![3, 5, 6, 7, 3];
-                buffers.write(4, 5, &test5_ele[..]);
-                assert_eq!(buffers.len(), 16);
-                //write /read in first
-                let test5_ele = vec![3, 5, 6, 7, 3];
-                buffers.write(16, 5, &test5_ele[..]);
-                assert_eq!(buffers.len(), 32);
-                sleep(time::Duration::from_secs(4));
-
-                let test5_ele = vec![3, 5, 6, 7, 3];
-                buffers.write(32, 5, &test5_ele[..]);
-                assert_eq!(buffers.len(), 48);
-            });
-            s.spawn(|_s| {
-                let mut buffers = MultiBuffer::new(4, "sector_14", &mem_pool);
-                // 16 * 2
-                assert_eq!(buffers.len(), 0);
-                //write /read in first
-                let test5_ele = vec![3, 5, 6, 7, 3];
-                buffers.write(4, 5, &test5_ele[..]);
-                assert_eq!(buffers.len(), 16);
-                //write /read in first
-                let test5_ele = vec![3, 5, 6, 7, 3];
-                buffers.write(16, 5, &test5_ele[..]);
-                assert_eq!(buffers.len(), 32);
-                sleep(time::Duration::from_secs(4));
-
-                let test5_ele = vec![3, 5, 6, 7, 3];
-                buffers.write(32, 5, &test5_ele[..]);
-                assert_eq!(buffers.len(), 48);
-            });
-            s.spawn(|_s| {
-                let mut buffers = MultiBuffer::new(4, "sector_15", &mem_pool);
-                // 16 * 2
-                assert_eq!(buffers.len(), 0);
-                //write /read in first
-                let test5_ele = vec![3, 5, 6, 7, 3];
-                buffers.write(4, 5, &test5_ele[..]);
-                assert_eq!(buffers.len(), 16);
-                //write /read in first
-                let test5_ele = vec![3, 5, 6, 7, 3];
-                buffers.write(16, 5, &test5_ele[..]);
-                assert_eq!(buffers.len(), 32);
-                sleep(time::Duration::from_secs(4));
-
-                let test5_ele = vec![3, 5, 6, 7, 3];
-                buffers.write(32, 5, &test5_ele[..]);
-                assert_eq!(buffers.len(), 48);
-            });
-            s.spawn(|_s| {
-                let mut buffers = MultiBuffer::new(4, "sector_16", &mem_pool);
-                // 16 * 2
-                assert_eq!(buffers.len(), 0);
-                //write /read in first
-                let test5_ele = vec![3, 5, 6, 7, 3];
-                buffers.write(4, 5, &test5_ele[..]);
-                assert_eq!(buffers.len(), 16);
-                //write /read in first
-                let test5_ele = vec![3, 5, 6, 7, 3];
-                buffers.write(16, 5, &test5_ele[..]);
-                assert_eq!(buffers.len(), 32);
-                sleep(time::Duration::from_secs(4));
-
-                let test5_ele = vec![3, 5, 6, 7, 3];
-                buffers.write(32, 5, &test5_ele[..]);
-                assert_eq!(buffers.len(), 48);
-            });
-            s.spawn(|_s| {
-                let mut buffers = MultiBuffer::new(4, "sector_17", &mem_pool);
-                // 16 * 2
-                assert_eq!(buffers.len(), 0);
-                //write /read in first
-                let test5_ele = vec![3, 5, 6, 7, 3];
-                buffers.write(4, 5, &test5_ele[..]);
-                assert_eq!(buffers.len(), 16);
-                //write /read in first
-                let test5_ele = vec![3, 5, 6, 7, 3];
-                buffers.write(16, 5, &test5_ele[..]);
-                assert_eq!(buffers.len(), 32);
-                sleep(time::Duration::from_secs(4));
-
-                let test5_ele = vec![3, 5, 6, 7, 3];
-                buffers.write(32, 5, &test5_ele[..]);
-                assert_eq!(buffers.len(), 48);
-            });
-            s.spawn(|_s| {
-                let mut buffers = MultiBuffer::new(4, "sector_18", &mem_pool);
-                // 16 * 2
-                assert_eq!(buffers.len(), 0);
-                //write /read in first
-                let test5_ele = vec![3, 5, 6, 7, 3];
-                buffers.write(4, 5, &test5_ele[..]);
-                assert_eq!(buffers.len(), 16);
-                //write /read in first
-                let test5_ele = vec![3, 5, 6, 7, 3];
-                buffers.write(16, 5, &test5_ele[..]);
-                assert_eq!(buffers.len(), 32);
-                sleep(time::Duration::from_secs(4));
-
-                let test5_ele = vec![3, 5, 6, 7, 3];
-                buffers.write(32, 5, &test5_ele[..]);
-                assert_eq!(buffers.len(), 48);
-            });
-            s.spawn(|_s| {
-                let mut buffers = MultiBuffer::new(4, "sector_19", &mem_pool);
-                // 16 * 2
-                assert_eq!(buffers.len(), 0);
-                //write /read in first
-                let test5_ele = vec![3, 5, 6, 7, 3];
-                buffers.write(4, 5, &test5_ele[..]);
-                assert_eq!(buffers.len(), 16);
-                //write /read in first
-                let test5_ele = vec![3, 5, 6, 7, 3];
-                buffers.write(16, 5, &test5_ele[..]);
-                assert_eq!(buffers.len(), 32);
-                sleep(time::Duration::from_secs(4));
-
-                let test5_ele = vec![3, 5, 6, 7, 3];
-                buffers.write(32, 5, &test5_ele[..]);
-                assert_eq!(buffers.len(), 48);
-            });
-            s.spawn(|_s| {
-                let mut buffers = MultiBuffer::new(4, "sector_20", &mem_pool);
-                // 16 * 2
-                assert_eq!(buffers.len(), 0);
-                //write /read in first
-                let test5_ele = vec![3, 5, 6, 7, 3];
-                buffers.write(4, 5, &test5_ele[..]);
-                assert_eq!(buffers.len(), 16);
-                //write /read in first
-                let test5_ele = vec![3, 5, 6, 7, 3];
-                buffers.write(16, 5, &test5_ele[..]);
-                assert_eq!(buffers.len(), 32);
-                sleep(time::Duration::from_secs(4));
-
-                let test5_ele = vec![3, 5, 6, 7, 3];
-                buffers.write(32, 5, &test5_ele[..]);
-                assert_eq!(buffers.len(), 48);
-            });
         });
     }
 

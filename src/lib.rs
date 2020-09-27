@@ -61,7 +61,7 @@ use parking_lot::{Mutex,Condvar};
 use std::mem::{ManuallyDrop, forget};
 use std::sync::Arc;
 use std::thread;
-
+use log::{trace};
 
 use parking_lot::lock_api::MutexGuard;
 
@@ -167,22 +167,22 @@ impl<T> MemoryPool<T> {
     }
     fn start_wakeup(&self){
         self.resources.1.recv();
-        println!("start wakeup");
+        trace!("start wakeup");
     }
 
     pub fn end_wakeup(&self) {
         self.resources.0.send(());
-        println!("end wakeup");
+        trace!("end wakeup");
     }
     pub fn get_item_no_lock(&self)->Option<Reusable<T>> {
-        println!("lock...");
+        trace!("lock...");
         let _x = self.run_block.lock();
-        println!("lock over....");
+        trace!("lock over....");
         if let Some(item) = self.objects.lock().pop() {
-            println!("objects lock. over...");
+            trace!("objects lock. over...");
             Some(Reusable::new(self,item))
         }else{
-            println!("objects lock. no item...");
+            trace!("objects lock. no item...");
             None
         }
     }
@@ -197,20 +197,20 @@ impl<T> MemoryPool<T> {
     #[inline]
     pub fn attach(&self, t: T) {
         //let _x = self.run_block.lock();
-        println!("attach started<<<<<<<<<<<<<<<<>>>>>>>>>>>>>>>>");
+        trace!("attach started<<<<<<<<<<<<<<<<>>>>>>>>>>>>>>>>");
         self.start_wakeup();
         { self.objects.lock().push(t); }
-        println!("recyled an item ");
+        trace!("recyled an item ");
         let mut wait_list = self.waiting.lock();
-        println!("check waiting list ok ");
+        trace!("check waiting list ok ");
         if wait_list.len() > 0 {
             if self.len() >= wait_list[0].min_request {
-                println!("remove ok<<<<<<<<<<<<<<<,, ");
+                trace!("remove ok<<<<<<<<<<<<<<<,, ");
                 let item = wait_list.remove(0);
-                println!("start wakeup<<<<<<<<<<<<<<<<<<<");
+                trace!("start wakeup<<<<<<<<<<<<<<<<<<<");
                 //&wait_list.remove(0);
 
-                println!("free cnts:{}, waking up  {}/ with min req:{} now.... ",self.len(),item.id.clone(),item.min_request);
+                trace!("free cnts:{}, waking up  {}/ with min req:{} now.... ",self.len(),item.id.clone(),item.min_request);
 
                 thread::spawn(move||{
                     item.notifier.send(()).unwrap();
@@ -219,7 +219,7 @@ impl<T> MemoryPool<T> {
                 self.end_wakeup();
             }
         }else {
-            println!("pending data ");
+            trace!("pending data ");
             if self.pending.lock().len() >0 {
                 let pending_item = self.pending.lock().remove(0);
                 thread::spawn(move|| {
@@ -228,7 +228,7 @@ impl<T> MemoryPool<T> {
             }
             self.end_wakeup();
         }
-        println!("attach finished<<<<<<<<<<<<<<<<>>>>>>>>>>>>>>>>");
+        trace!("attach finished<<<<<<<<<<<<<<<<>>>>>>>>>>>>>>>>");
     }
 }
 
