@@ -33,14 +33,14 @@ macro_rules! prefetchl0 {
         }
     };
 }
-pub struct MultiBuffer<'a> {
+pub struct MultiBuffer {
     seg_exp: u8,
     seg_len: usize,
     seg_len_mask: usize,
     //fast calculation
-    buffers: Vec<Reusable<'a, Vec<u8>>>,
+    buffers: Vec<Reusable< Vec<u8>>>,
     total_len: usize,
-    mem_pool: &'a MemoryPool<Vec<u8>>,
+    mem_pool: &'static MemoryPool<Vec<u8>>,
     id: String,
     store_files: Vec<PathBuf>,
     path_parent: PathBuf,
@@ -62,7 +62,7 @@ pub struct SEG_PT{
     pub segment:u8,
     pub offset:u32
 }
-impl<'a> Drop for MultiBuffer<'a> {
+impl Drop for MultiBuffer {
     fn drop(&mut self) {
         Command::new("mkdir")
             .arg("-p")
@@ -72,8 +72,8 @@ impl<'a> Drop for MultiBuffer<'a> {
     }
 }
 
-impl<'a> MultiBuffer<'a> {
-    pub fn new(seg_exp: u8, id: &str, mem_pool: &'a MemoryPool<Vec<u8>>) -> Self {
+impl MultiBuffer {
+    pub fn new(seg_exp: u8, id: &str, mem_pool: &'static MemoryPool<Vec<u8>>) -> Self {
         let seg_len = (1 << seg_exp);
         let mut path_parent = if let Ok(path_cache) = env::var(ENV_MEMORY_CACHE) {
             PathBuf::from(path_cache)
@@ -205,40 +205,40 @@ impl<'a> MultiBuffer<'a> {
 
     fn get_memory(&mut self) {
         let (sender, receiver) = crossbeam_channel::unbounded();
-        let (item, should_sleep) = self.mem_pool.pending(&self.id, sender.clone());
+        let min_req = self.buffers.len() ;
+        let (item, should_sleep) = self.mem_pool.pending(&self.id, sender.clone(),min_req);
 
         if let Some(item) = item {
-            trace!("{} get an item,left:{}", self.id.clone(), self.mem_pool.len());
+            println!("{} get an item,left:{}", self.id.clone(), self.mem_pool.len());
             self.buffers.push(item);
         } else if !should_sleep {
-            trace!("{} pending an item ", self.id.clone());
-            receiver.recv().unwrap();
-            trace!("{} pending finished ", self.id.clone());
-            self.buffers.push(self.mem_pool.get_item().unwrap());
+            println!("{} pending an item ", self.id.clone());
+            let result = receiver.recv().unwrap();
+            println!("{} pending finished ", self.id.clone());
+
+            self.buffers.push(result);
         } else {
-            let min_req = self.buffers.len() + 1;
-            trace!("{} sleep with min_req:{} ", self.id.clone(), min_req);
-            //通知mem pool 我自觉释放了
-            self.mem_pool.start_sleep((&self).id.clone(), min_req, sender.clone());
-            trace!("{} starting sleep:{} ", self.id.clone(), min_req);
-            //休眠
+
+            println!("{} sleep with min_req:{} ", self.id.clone(), min_req);
+
             self.sleep();
-            //通知内存已经释放
-            self.mem_pool.sleep_ok();
-            trace!("{} sleeped ok:{} ", self.id.clone(), min_req);
-            //等待允许启动
-            let _result = receiver.recv().unwrap();
-            trace!("{} awake now min_req:{} ", self.id.clone(), min_req);
-            //获取内存
-            for i in 0..min_req {
-                trace!("{} getting memory:{} ", self.id.clone(), i);
-                self.buffers.push(self.mem_pool.get_item_no_lock().unwrap())
+
+            println!("{} sleeped ok:{} ", self.id.clone(), min_req);
+            let mut recovered = 0;
+            loop {
+                let result =  receiver.recv().unwrap();
+                self.buffers.push(result);
+                recovered += 1;
+                if recovered > min_req {
+                    break;
+                }
             }
-            trace!("{} waked up with min_req:{} ", self.id.clone(), min_req);
-            self.mem_pool.end_wakeup();
+
+            println!("{} waked up with min_req:{} ", self.id.clone(), min_req);
+
             //恢复
             self.wakeup();
-            trace!("{} waked up !!!! ", self.id.clone());
+            println!("{} waked up !!!! ", self.id.clone());
         }
     }
     #[inline]
@@ -246,6 +246,13 @@ impl<'a> MultiBuffer<'a> {
         unsafe {
                 std::ptr::copy_nonoverlapping((&source).as_ptr(), self.buffers[start >> self.seg_exp][start & (self.seg_len_mask)..].as_mut_ptr(), len);
                 //  &self.buffers[start_seg][seg_offset..seg_offset+len].clone_from_slice(&source[..len]);
+        }
+    }
+    #[inline]
+    pub fn read_ensured(&self, start: usize, len: usize, source: &mut [u8])  {
+        unsafe {
+            std::ptr::copy_nonoverlapping(self.buffers[start >> self.seg_exp][start & (self.seg_len_mask)..].as_ptr(),  source.as_mut_ptr(), len);
+            //  &self.buffers[start_seg][seg_offset..seg_offset+len].clone_from_slice(&source[..len]);
         }
     }
     #[inline]
@@ -308,7 +315,7 @@ impl<'a> MultiBuffer<'a> {
         }
     }
     fn sleep(&mut self) {
-        trace!("{} sleeping with min_req:{}", self.id.clone(), &self.buffers.len() + 1);
+        println!("{} sleeping with min_req:{}", self.id.clone(), &self.buffers.len() + 1);
         self.store_files.clear();
         for (i, val) in self.buffers.iter().enumerate() {
             let file_name = self.path_parent.join(format!("cache_{}.dat", i));
@@ -318,11 +325,12 @@ impl<'a> MultiBuffer<'a> {
         }
         drop(&self.buffers);
         self.buffers = Vec::new();
+        println!("{} slept ok",self.id.clone())
         // sleep(std::time::Duration::from_secs(3));
     }
     fn wakeup(&mut self) {
         let total_count = self.store_files.len();
-        trace!("{} wake up with min_req:{}", self.id.clone(), total_count);
+        println!("{} wake up with min_req:{}", self.id.clone(), total_count+1);
         for file_id in 0..total_count {
             let file_path = self.path_parent.join(format!("cache_{}.dat", file_id));
             let mut open_option = OpenOptions::new();
@@ -333,12 +341,13 @@ impl<'a> MultiBuffer<'a> {
                 file.read_exact(&mut data[..file_len as usize]);
                 //file.read_to_end(data);
 
-                trace!("remove mem cache file:{:?}", &file_path.display());
+                println!("remove mem cache file:{:?}", &file_path.display());
                 fs::remove_file(&file_path);
             } else {
                 panic!("memory cache lost:{:?}", file_path.display())
             }
         }
+        println!("wake up finished!");
         self.store_files.clear();
     }
 
@@ -377,8 +386,6 @@ impl<'a> MultiBuffer<'a> {
                 }
             }
         }
-
-
         all_read_size
     }
 }
@@ -387,7 +394,7 @@ pub trait GetSegs<T> {
     fn get_buffers(&self) -> Vec<(&Vec<u8>, usize)>;
 }
 
-impl<'a> GetSegs<u8> for MultiBuffer<'a> {
+impl GetSegs<u8> for MultiBuffer {
     fn get_buffers(&self) -> Vec<(&Vec<u8>, usize)> {
         let mut result = Vec::new();
         let total_segs = self.buffers.len() - 1;
@@ -411,14 +418,15 @@ mod Tests {
     use std::thread::sleep;
     use crate::MemoryPool;
     use lazy_static::lazy_static;
-    const buf_len:usize = 1<<30;
+    use rand;
+    const buf_len:usize = 1<<12;
     lazy_static! {
         pub static ref mem_pool:MemoryPool<Vec<u8>> = MemoryPool::new(4,||{vec![0u8;buf_len]});
     }
 
     #[test]
     pub fn test_all_case() {
-        let mut buffers = MultiBuffer::new(4, "sector_1", &mem_pool);
+        let mut buffers = MultiBuffer::new(12, "sector_1", &mem_pool);
         assert_eq!(buffers.len(), 0);
         //write /read in first
         let test5_ele = vec![3, 5, 6, 7, 3];
@@ -442,11 +450,13 @@ mod Tests {
 
     #[test]
     pub fn test_sleep() {
+
         rayon::scope(|s| {
-            for i in 0..20
+
+            for i in 0..30
             {
                 s.spawn(move |_s| {
-                    let mut buffers = MultiBuffer::new(30, &format!("sector_{}",i), &mem_pool);
+                    let mut buffers = MultiBuffer::new(12, &format!("sector_{}",i), &mem_pool);
                     // 16 * 2
                     assert_eq!(buffers.len(), 0);
                     //write /read in first
@@ -457,15 +467,17 @@ mod Tests {
                     let test5_ele = vec![3, 5, 6, 7, 3];
                     buffers.write(buf_len, 5, &test5_ele[..]);
                     assert_eq!(buffers.len(), buf_len * 2);
-                    sleep(time::Duration::from_secs(2));
-
+                    sleep(time::Duration::from_millis(rand::random::<u8>() as u64 * 10 ) );
+                    println!("------------sector_{} asked for more buffer",i);
                     let test5_ele = vec![3, 5, 6, 7, 3];
                     buffers.write(buf_len * 2, 5, &test5_ele[..]);
                     assert_eq!(buffers.len(), buf_len * 3);
+                    println!("------------sector_{} finsihed",i);
                 });
             }
 
         });
+
     }
 
     #[test]

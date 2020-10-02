@@ -1,4 +1,3 @@
-
 //! A thread-safe object pool with automatic return and attach/detach semantics
 //!
 //! The goal of an object pool is to reuse expensive to allocate objects or frequently allocated objects
@@ -52,194 +51,172 @@
 //! or any other equivalent for the object that you are using, after pulling from the pool
 //!
 //! [`std::sync::Arc`]: https://doc.rust-lang.org/stable/std/sync/struct.Arc.html
-mod multi_buf ;
+mod multi_buf;
+mod semphore;
 
-pub use multi_buf::{MultiBuffer,GetSegs};
+pub use multi_buf::{MultiBuffer, GetSegs};
 use crossbeam::channel;
 use std::ops::{Deref, DerefMut};
-use parking_lot::{Mutex,Condvar};
+use parking_lot::{Mutex, Condvar};
 use std::mem::{ManuallyDrop, forget};
 use std::sync::Arc;
 use std::thread;
 use log::{trace};
 
 use parking_lot::lock_api::MutexGuard;
+use futures::SinkExt;
 
 pub type Stack<T> = Vec<T>;
 
-pub struct PendingInfo{
-    id:String,
-    notifier:channel::Sender<()>,
+pub struct PendingInfo<T>
+    where T: Sync + Send +'static
+{
+    id: String,
+    notifier: channel::Sender<T>,
 }
 
-pub struct WaitingInfo{
-    id:String,
+pub struct WaitingInfo<T>
+    where T: Sync + Send + 'static
+{
+    id: String,
     //发送恢复命令
-    notifier:channel::Sender<()>,
+    notifier: channel::Sender<T>,
     ///最低需要多少个内存单元才能恢复
-    min_request:usize,
+    min_request: usize,
 }
-pub struct MemoryPool<T> {
-    objects:Arc<Mutex<Stack<T>>>,
-    resources:(channel::Sender<()>,channel::Receiver<()>),
 
-    resources_judging:(channel::Sender<()>,channel::Receiver<()>),
-    run_block:Arc<Mutex<bool>>,
+pub struct MemoryPool<T>
+    where T: Sync + Send + 'static
+{
+    objects: (channel::Sender<T>, channel::Receiver<T>),
+
     // the one wait for data
-    pending:Arc<Mutex<Vec<PendingInfo>>>,
+    pending: Arc<Mutex<Vec<PendingInfo<Reusable<T>>>>>,
     ///those who is sleeping
-    waiting:Arc<Mutex<Vec<WaitingInfo>>>,
-
+    waiting: Arc<Mutex<Vec<WaitingInfo<Reusable<T>>>>>,
+   // recycle: (channel::Sender<Reusable<'a,T>>, channel::Receiver<Reusable<'a,T>>),
 }
 
-impl<T> MemoryPool<T> {
+impl<T> MemoryPool<T> where T: Sync + Send + 'static {
     #[inline]
     pub fn new<F>(cap: usize, init: F) -> MemoryPool<T>
         where
             F: Fn() -> T,
     {
-        let mut objects = Stack::new();
 
+        // println!("mempool remains:{}", cap);
+
+        let mut objects = channel::unbounded();
         for _ in 0..cap {
-            objects.push(init());
+            &objects.0.send(init());
         }
-       // println!("mempool remains:{}", cap);
+         MemoryPool {
+            objects,
 
-        MemoryPool {
-            objects: Arc::new(Mutex::new(objects)),
-            run_block:Arc::new(Mutex::new(false)),
-            resources: {
-                let res = channel::unbounded();
-                res.0.send(());
-                res
-            },
-            resources_judging: {
-                let res = channel::unbounded();
-                res.0.send(());
-                res
-            },
-            pending:Arc::new(Mutex::new(Vec::new())),
-            waiting:Arc::new(Mutex::new(Vec::new())),
+            pending: Arc::new(Mutex::new(Vec::new())),
+            waiting: Arc::new(Mutex::new(Vec::new())),
+
         }
     }
 
+
+
     #[inline]
     pub fn len(&self) -> usize {
-        self.objects.lock().len()
+        self.objects.1.len()
     }
 
     #[inline]
     pub fn is_empty(&self) -> bool {
-        self.objects.lock().is_empty()
+        self.objects.1.is_empty()
     }
 
     #[inline]
-    pub fn pending(&self,str:&str,sender:channel::Sender<()>) ->(Option<Reusable<T>>,bool) {
+    pub fn pending(&'static self, str: &str, sender: channel::Sender<Reusable<T>>,releasable:usize) -> (Option<Reusable<T>>, bool) {
+        println!("pending item:{}", str);
 
-       self.resources_judging.1.recv().unwrap();
-        if let Some(item) = self.get_item() {
-            self.resources_judging.0.send(()).unwrap();
-            (Some(item),false)
-        }else if (self.pending.lock().len() == 0) {
-            self.pending.lock().push(PendingInfo{
-                id:String::from(str),
-                notifier:sender.clone()
+        let ret = if let Ok(item) = self.objects.1.try_recv() {
+            println!("get ok:{}", str);
+            (Some(Reusable::new(&self,item)), false)
+        } else if (self.pending.lock().len() == 0) {
+            println!("get should pend:{}", str);
+            self.pending.lock().push(PendingInfo {
+                id: String::from(str),
+                notifier: sender.clone(),
             });
-            self.resources_judging.0.send(()).unwrap();
-            (None,false)
-        }else{
-            (None,true)
-        }
 
-    }
-    #[inline]
-    pub fn start_sleep(&self,id:String,min_req:usize,notifier:channel::Sender<()>){
-        let _x = self.run_block.lock();
-        self.waiting.lock().push(WaitingInfo{
-            id:id.clone(),
-            notifier,
-            min_request:min_req
-        })
-    }
-    #[inline]
-    pub fn sleep_ok(&self){
-        self.resources_judging.0.send(()).unwrap();
-    }
-    fn start_wakeup(&self){
-        self.resources.1.recv();
-        trace!("start wakeup");
+            (None, false)
+        } else {
+            println!("get should sleep :{}", str);
+            self.waiting.lock().push(WaitingInfo{
+                id:String::from(str),
+                notifier:sender.clone(),
+                min_request: releasable
+            });
+            (None, true)
+        };
+
+        ret
     }
 
-    pub fn end_wakeup(&self) {
-        self.resources.0.send(());
-        trace!("end wakeup");
-    }
-    pub fn get_item_no_lock(&self)->Option<Reusable<T>> {
-        trace!("lock...");
-        let _x = self.run_block.lock();
-        trace!("lock over....");
-        if let Some(item) = self.objects.lock().pop() {
-            trace!("objects lock. over...");
-            Some(Reusable::new(self,item))
-        }else{
-            trace!("objects lock. no item...");
-            None
-        }
-    }
-    pub fn get_item(&self) ->Option<Reusable<T>> {
-        self.resources.1.recv();
-        let val = self.get_item_no_lock();
-        self.resources.0.send(());
-        val
-    }
+
 
 
     #[inline]
-    pub fn attach(&self, t: T) {
+    pub fn attach(&'static self, t: T) {
         //let _x = self.run_block.lock();
-        trace!("attach started<<<<<<<<<<<<<<<<>>>>>>>>>>>>>>>>");
-        self.start_wakeup();
-        { self.objects.lock().push(t); }
-        trace!("recyled an item ");
-        let mut wait_list = self.waiting.lock();
-        trace!("check waiting list ok ");
-        if wait_list.len() > 0 {
-            if self.len() >= wait_list[0].min_request {
-                trace!("remove ok<<<<<<<<<<<<<<<,, ");
+        println!("attach started<<<<<<<<<<<<<<<<");
+
+        println!("recyled an item ");
+        let mut wait_list = { self.waiting.lock() };
+        println!("check waiting list ok :{}",wait_list.len());
+        if wait_list.len() > 0  && self.len() >= wait_list[0].min_request{
+
+                println!("remove ok<<<<<<<<<<<<<<< ");
                 let item = wait_list.remove(0);
-                trace!("start wakeup<<<<<<<<<<<<<<<<<<<");
+                println!("start wakeup<<<<<<<<<<<<<<<<<<<");
                 //&wait_list.remove(0);
 
-                trace!("free cnts:{}, waking up  {}/ with min req:{} now.... ",self.len(),item.id.clone(),item.min_request);
-
-                thread::spawn(move||{
-                    item.notifier.send(()).unwrap();
-                });
-            }else{
-                self.end_wakeup();
-            }
-        }else {
-            trace!("pending data ");
-            if self.pending.lock().len() >0 {
+                println!("free cnts:{}, waking up  {}/ with min req:{} now.... ", self.len(), item.id.clone(), item.min_request);
+                self.objects.0.send(t).unwrap();
+                for i in 0 ..self.len(){
+                    item.notifier.send(Reusable::new(&self,self.objects.1.recv().unwrap()));
+                }
+                // thread::spawn(move || {
+                //     item.notifier.send(()).unwrap();
+                // });
+        } else  if self.pending.lock().len() > 0 {
+                drop(wait_list);
                 let pending_item = self.pending.lock().remove(0);
-                thread::spawn(move|| {
-                    pending_item.notifier.send(());
-                });
-            }
-            self.end_wakeup();
+                println!("fill pending:{}",pending_item.id);
+                // thread::spawn(move || {
+                //     pending_item.notifier.send(());
+                // });
+                pending_item.notifier.send(Reusable::new(&self,t));
+
+        }else{
+            drop(wait_list);
+
+            self.objects.0.send(t).unwrap();
+            println!("push to queue:{}",self.len());
         }
-        trace!("attach finished<<<<<<<<<<<<<<<<>>>>>>>>>>>>>>>>");
+
+
     }
 }
 
-pub struct Reusable<'a, T> {
-    pool: &'a MemoryPool<T>,
+
+
+pub struct Reusable<T>
+    where T: Sync + Send + 'static {
+    pool: &'static MemoryPool<T>,
     data: ManuallyDrop<T>,
 }
 
-impl<'a, T> Reusable<'a, T> {
+impl<T> Reusable< T>
+    where T: Sync + Send + 'static {
     #[inline]
-    pub fn new(pool: &'a MemoryPool<T>, t: T) -> Self {
+    pub fn new(pool: &'static MemoryPool<T>, t: T) -> Self {
         Self {
             pool,
             data: ManuallyDrop::new(t),
@@ -258,7 +235,9 @@ impl<'a, T> Reusable<'a, T> {
     }
 }
 
-impl<'a, T> Deref for Reusable<'a, T> {
+impl<T> Deref for Reusable< T>
+    where T: Sync + Send + 'static
+{
     type Target = T;
 
     #[inline]
@@ -267,19 +246,21 @@ impl<'a, T> Deref for Reusable<'a, T> {
     }
 }
 
-impl<'a, T> DerefMut for Reusable<'a, T> {
+impl<T> DerefMut for Reusable<T>
+    where T: Sync + Send + 'static
+{
     #[inline]
     fn deref_mut(&mut self) -> &mut Self::Target {
         &mut self.data
     }
 }
 
-impl<'a, T> Drop for Reusable<'a, T> {
+impl<T> Drop for Reusable<T>
+    where T: Sync + Send + 'static
+{
     #[inline]
     fn drop(&mut self) {
-
         unsafe { self.pool.attach(self.take()); }
-
     }
 }
 
