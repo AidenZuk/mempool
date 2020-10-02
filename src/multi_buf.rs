@@ -453,7 +453,7 @@ mod Tests {
 
         rayon::scope(|s| {
 
-            for i in 0..30
+            for i in 0..100
             {
                 s.spawn(move |_s| {
                     let mut buffers = MultiBuffer::new(12, &format!("sector_{}",i), &mem_pool);

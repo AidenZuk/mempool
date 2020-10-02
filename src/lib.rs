@@ -94,6 +94,7 @@ pub struct MemoryPool<T>
     pending: Arc<Mutex<Vec<PendingInfo<Reusable<T>>>>>,
     ///those who is sleeping
     waiting: Arc<Mutex<Vec<WaitingInfo<Reusable<T>>>>>,
+    run_block:Arc<Mutex<()>>,
    // recycle: (channel::Sender<Reusable<'a,T>>, channel::Receiver<Reusable<'a,T>>),
 }
 
@@ -115,6 +116,7 @@ impl<T> MemoryPool<T> where T: Sync + Send + 'static {
 
             pending: Arc::new(Mutex::new(Vec::new())),
             waiting: Arc::new(Mutex::new(Vec::new())),
+             run_block:Arc::new(Mutex::new(())),
 
         }
     }
@@ -164,7 +166,7 @@ impl<T> MemoryPool<T> where T: Sync + Send + 'static {
 
     #[inline]
     pub fn attach(&'static self, t: T) {
-        //let _x = self.run_block.lock();
+        let _x = self.run_block.lock();
         println!("attach started<<<<<<<<<<<<<<<<");
 
         println!("recyled an item ");
