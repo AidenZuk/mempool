@@ -65,6 +65,7 @@ use log::{trace};
 
 use parking_lot::lock_api::MutexGuard;
 use futures::SinkExt;
+use std::thread::sleep;
 
 pub type Stack<T> = Vec<T>;
 
@@ -95,6 +96,7 @@ pub struct MemoryPool<T>
     ///those who is sleeping
     waiting: Arc<Mutex<Vec<WaitingInfo<Reusable<T>>>>>,
     run_block:Arc<Mutex<()>>,
+    pending_block:Arc<Mutex<()>>,
    // recycle: (channel::Sender<Reusable<'a,T>>, channel::Receiver<Reusable<'a,T>>),
 }
 
@@ -117,6 +119,7 @@ impl<T> MemoryPool<T> where T: Sync + Send + 'static {
             pending: Arc::new(Mutex::new(Vec::new())),
             waiting: Arc::new(Mutex::new(Vec::new())),
              run_block:Arc::new(Mutex::new(())),
+             pending_block:Arc::new(Mutex::new(())),
 
         }
     }
@@ -136,7 +139,7 @@ impl<T> MemoryPool<T> where T: Sync + Send + 'static {
     #[inline]
     pub fn pending(&'static self, str: &str, sender: channel::Sender<Reusable<T>>,releasable:usize) -> (Option<Reusable<T>>, bool) {
         println!("pending item:{}", str);
-
+        let _x = self.pending_block.lock();
         let ret = if let Ok(item) = self.objects.1.try_recv() {
             println!("get ok:{}", str);
             (Some(Reusable::new(&self,item)), false)
@@ -149,13 +152,21 @@ impl<T> MemoryPool<T> where T: Sync + Send + 'static {
 
             (None, false)
         } else {
-            println!("get should sleep :{}", str);
-            self.waiting.lock().push(WaitingInfo{
-                id:String::from(str),
-                notifier:sender.clone(),
-                min_request: releasable
-            });
-            (None, true)
+            println!("try again :{}", str);
+            sleep(std::time::Duration::from_secs(15));
+            if let Ok(item) = self.objects.1.try_recv() {
+                println!("get ok:{}", str);
+                (Some(Reusable::new(&self,item)), false)
+            }else{
+                println!("get should sleep :{}", str);
+                self.waiting.lock().push(WaitingInfo{
+                    id:String::from(str),
+                    notifier:sender.clone(),
+                    min_request: releasable
+                });
+                (None, true)
+            }
+
         };
 
         ret
