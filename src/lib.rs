@@ -151,7 +151,7 @@ impl<T> MemoryPool<T> where T: Sync + Send + 'static {
 
             (None, false)
         } else {
-            let to_retry = { self.waiting.lock().len() * 15 + 15 };
+            let to_retry = { self.waiting.lock().len() * 15 + 2 };
             println!("try again :{} with retries backoff:{}", str, to_retry);
             for i in 0..to_retry {
                 sleep(std::time::Duration::from_secs(1));
