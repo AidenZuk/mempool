@@ -421,7 +421,7 @@ mod Tests {
     use rand;
     const buf_len:usize = 1<<12;
     lazy_static! {
-        pub static ref mem_pool:MemoryPool<Vec<u8>> = MemoryPool::new(4,||{vec![0u8;buf_len]});
+        pub static ref mem_pool:MemoryPool<Vec<u8>> = MemoryPool::new(7,||{vec![0u8;buf_len]});
     }
 
     #[test]
@@ -453,7 +453,7 @@ mod Tests {
 
         rayon::scope(|s| {
 
-            for i in 0..100
+            for i in 0..4
             {
                 s.spawn(move |_s| {
                     let mut buffers = MultiBuffer::new(12, &format!("sector_{}",i), &mem_pool);

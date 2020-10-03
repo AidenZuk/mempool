@@ -70,7 +70,7 @@ use std::thread::sleep;
 pub type Stack<T> = Vec<T>;
 
 pub struct PendingInfo<T>
-    where T: Sync + Send +'static
+    where T: Sync + Send + 'static
 {
     id: String,
     notifier: channel::Sender<T>,
@@ -95,9 +95,9 @@ pub struct MemoryPool<T>
     pending: Arc<Mutex<Vec<PendingInfo<Reusable<T>>>>>,
     ///those who is sleeping
     waiting: Arc<Mutex<Vec<WaitingInfo<Reusable<T>>>>>,
-    run_block:Arc<Mutex<()>>,
-    pending_block:Arc<Mutex<()>>,
-   // recycle: (channel::Sender<Reusable<'a,T>>, channel::Receiver<Reusable<'a,T>>),
+    run_block: Arc<Mutex<()>>,
+    pending_block: Arc<Mutex<()>>,
+    // recycle: (channel::Sender<Reusable<'a,T>>, channel::Receiver<Reusable<'a,T>>),
 }
 
 impl<T> MemoryPool<T> where T: Sync + Send + 'static {
@@ -113,17 +113,16 @@ impl<T> MemoryPool<T> where T: Sync + Send + 'static {
         for _ in 0..cap {
             &objects.0.send(init());
         }
-         MemoryPool {
+        MemoryPool {
             objects,
 
             pending: Arc::new(Mutex::new(Vec::new())),
             waiting: Arc::new(Mutex::new(Vec::new())),
-             run_block:Arc::new(Mutex::new(())),
-             pending_block:Arc::new(Mutex::new(())),
+            run_block: Arc::new(Mutex::new(())),
+            pending_block: Arc::new(Mutex::new(())),
 
         }
     }
-
 
 
     #[inline]
@@ -137,12 +136,12 @@ impl<T> MemoryPool<T> where T: Sync + Send + 'static {
     }
 
     #[inline]
-    pub fn pending(&'static self, str: &str, sender: channel::Sender<Reusable<T>>,releasable:usize) -> (Option<Reusable<T>>, bool) {
+    pub fn pending(&'static self, str: &str, sender: channel::Sender<Reusable<T>>, releasable: usize) -> (Option<Reusable<T>>, bool) {
         println!("pending item:{}", str);
         let _x = self.pending_block.lock();
         let ret = if let Ok(item) = self.objects.1.try_recv() {
             println!("get ok:{}", str);
-            (Some(Reusable::new(&self,item)), false)
+            (Some(Reusable::new(&self, item)), false)
         } else if (self.pending.lock().len() == 0) {
             println!("get should pend:{}", str);
             self.pending.lock().push(PendingInfo {
@@ -152,27 +151,27 @@ impl<T> MemoryPool<T> where T: Sync + Send + 'static {
 
             (None, false)
         } else {
-            println!("try again :{}", str);
-            sleep(std::time::Duration::from_secs(15));
-            if let Ok(item) = self.objects.1.try_recv() {
-                println!("get ok:{}", str);
-                (Some(Reusable::new(&self,item)), false)
-            }else{
-                println!("get should sleep :{}", str);
-                self.waiting.lock().push(WaitingInfo{
-                    id:String::from(str),
-                    notifier:sender.clone(),
-                    min_request: releasable
-                });
-                (None, true)
+            let to_retry = { self.waiting.lock().len() * 15 + 15 };
+            println!("try again :{} with retries backoff:{}", str, to_retry);
+            for i in 0..to_retry {
+                sleep(std::time::Duration::from_secs(1));
+                if let Ok(item) = self.objects.1.try_recv() {
+                    println!("get ok:{}", str);
+                    return (Some(Reusable::new(&self, item)), false);
+                }
             }
 
+            println!("get should sleep :{}", str);
+            self.waiting.lock().push(WaitingInfo {
+                id: String::from(str),
+                notifier: sender.clone(),
+                min_request: releasable,
+            });
+            (None, true)
         };
 
         ret
     }
-
-
 
 
     #[inline]
@@ -182,42 +181,37 @@ impl<T> MemoryPool<T> where T: Sync + Send + 'static {
 
         println!("recyled an item ");
         let mut wait_list = { self.waiting.lock() };
-        println!("check waiting list ok :{}",wait_list.len());
-        if wait_list.len() > 0  && self.len() >= wait_list[0].min_request{
+        println!("check waiting list ok :{}", wait_list.len());
+        if wait_list.len() > 0 && self.len() >= wait_list[0].min_request {
+            println!("remove ok<<<<<<<<<<<<<<< ");
+            let item = wait_list.remove(0);
+            println!("start wakeup<<<<<<<<<<<<<<<<<<<");
+            //&wait_list.remove(0);
 
-                println!("remove ok<<<<<<<<<<<<<<< ");
-                let item = wait_list.remove(0);
-                println!("start wakeup<<<<<<<<<<<<<<<<<<<");
-                //&wait_list.remove(0);
-
-                println!("free cnts:{}, waking up  {}/ with min req:{} now.... ", self.len(), item.id.clone(), item.min_request);
-                self.objects.0.send(t).unwrap();
-                for i in 0 ..self.len(){
-                    item.notifier.send(Reusable::new(&self,self.objects.1.recv().unwrap()));
-                }
-                // thread::spawn(move || {
-                //     item.notifier.send(()).unwrap();
-                // });
-        } else  if self.pending.lock().len() > 0 {
-                drop(wait_list);
-                let pending_item = self.pending.lock().remove(0);
-                println!("fill pending:{}",pending_item.id);
-                // thread::spawn(move || {
-                //     pending_item.notifier.send(());
-                // });
-                pending_item.notifier.send(Reusable::new(&self,t));
-
-        }else{
+            println!("free cnts:{}, waking up  {}/ with min req:{} now.... ", self.len(), item.id.clone(), item.min_request);
+            self.objects.0.send(t).unwrap();
+            for i in 0..self.len() {
+                item.notifier.send(Reusable::new(&self, self.objects.1.recv().unwrap()));
+            }
+            // thread::spawn(move || {
+            //     item.notifier.send(()).unwrap();
+            // });
+        } else if self.pending.lock().len() > 0 {
+            drop(wait_list);
+            let pending_item = self.pending.lock().remove(0);
+            println!("fill pending:{}", pending_item.id);
+            // thread::spawn(move || {
+            //     pending_item.notifier.send(());
+            // });
+            pending_item.notifier.send(Reusable::new(&self, t));
+        } else {
             drop(wait_list);
 
             self.objects.0.send(t).unwrap();
-            println!("push to queue:{}",self.len());
+            println!("push to queue:{}", self.len());
         }
-
-
     }
 }
-
 
 
 pub struct Reusable<T>
@@ -226,7 +220,7 @@ pub struct Reusable<T>
     data: ManuallyDrop<T>,
 }
 
-impl<T> Reusable< T>
+impl<T> Reusable<T>
     where T: Sync + Send + 'static {
     #[inline]
     pub fn new(pool: &'static MemoryPool<T>, t: T) -> Self {
@@ -248,7 +242,7 @@ impl<T> Reusable< T>
     }
 }
 
-impl<T> Deref for Reusable< T>
+impl<T> Deref for Reusable<T>
     where T: Sync + Send + 'static
 {
     type Target = T;
