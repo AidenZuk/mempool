@@ -62,7 +62,7 @@ use std::mem::{ManuallyDrop, forget};
 use std::sync::Arc;
 use std::thread;
 use log::{trace};
-
+pub use semphore::Semphore;
 use parking_lot::lock_api::MutexGuard;
 use futures::SinkExt;
 use std::thread::sleep;
