@@ -107,7 +107,7 @@ impl<T> MemoryPool<T> where T: Sync + Send + 'static {
             F: Fn() -> T,
     {
 
-        // println!("mempool remains:{}", cap);
+        // //println!("mempool remains:{}", cap);
 
         let mut objects = channel::unbounded();
         for _ in 0..cap {
@@ -137,13 +137,13 @@ impl<T> MemoryPool<T> where T: Sync + Send + 'static {
 
     #[inline]
     pub fn pending(&'static self, str: &str, sender: channel::Sender<Reusable<T>>, releasable: usize) -> (Option<Reusable<T>>, bool) {
-        println!("pending item:{}", str);
+        //println!("pending item:{}", str);
         let _x = self.pending_block.lock();
         let ret = if let Ok(item) = self.objects.1.try_recv() {
-            println!("get ok:{}", str);
+            //println!("get ok:{}", str);
             (Some(Reusable::new(&self, item)), false)
         } else if (self.pending.lock().len() == 0) {
-            println!("get should pend:{}", str);
+            //println!("get should pend:{}", str);
             self.pending.lock().push(PendingInfo {
                 id: String::from(str),
                 notifier: sender.clone(),
@@ -152,16 +152,16 @@ impl<T> MemoryPool<T> where T: Sync + Send + 'static {
             (None, false)
         } else {
             let to_retry = { self.waiting.lock().len() * 15 + 2 };
-            println!("try again :{} with retries backoff:{}", str, to_retry);
+            //println!("try again :{} with retries backoff:{}", str, to_retry);
             for i in 0..to_retry {
                 sleep(std::time::Duration::from_secs(1));
                 if let Ok(item) = self.objects.1.try_recv() {
-                    println!("get ok:{}", str);
+                    //println!("get ok:{}", str);
                     return (Some(Reusable::new(&self, item)), false);
                 }
             }
 
-            println!("get should sleep :{}", str);
+            //println!("get should sleep :{}", str);
             self.waiting.lock().push(WaitingInfo {
                 id: String::from(str),
                 notifier: sender.clone(),
@@ -177,18 +177,18 @@ impl<T> MemoryPool<T> where T: Sync + Send + 'static {
     #[inline]
     pub fn attach(&'static self, t: T) {
         let _x = self.run_block.lock();
-        println!("attach started<<<<<<<<<<<<<<<<");
+        //println!("attach started<<<<<<<<<<<<<<<<");
 
-        println!("recyled an item ");
+        //println!("recyled an item ");
         let mut wait_list = { self.waiting.lock() };
-        println!("check waiting list ok :{}", wait_list.len());
+        //println!("check waiting list ok :{}", wait_list.len());
         if wait_list.len() > 0 && self.len() >= wait_list[0].min_request {
-            println!("remove ok<<<<<<<<<<<<<<< ");
+            //println!("remove ok<<<<<<<<<<<<<<< ");
             let item = wait_list.remove(0);
-            println!("start wakeup<<<<<<<<<<<<<<<<<<<");
+            //println!("start wakeup<<<<<<<<<<<<<<<<<<<");
             //&wait_list.remove(0);
 
-            println!("free cnts:{}, waking up  {}/ with min req:{} now.... ", self.len(), item.id.clone(), item.min_request);
+            //println!("free cnts:{}, waking up  {}/ with min req:{} now.... ", self.len(), item.id.clone(), item.min_request);
             self.objects.0.send(t).unwrap();
             for i in 0..self.len() {
                 item.notifier.send(Reusable::new(&self, self.objects.1.recv().unwrap()));
@@ -199,7 +199,7 @@ impl<T> MemoryPool<T> where T: Sync + Send + 'static {
         } else if self.pending.lock().len() > 0 {
             drop(wait_list);
             let pending_item = self.pending.lock().remove(0);
-            println!("fill pending:{}", pending_item.id);
+            //println!("fill pending:{}", pending_item.id);
             // thread::spawn(move || {
             //     pending_item.notifier.send(());
             // });
@@ -208,7 +208,7 @@ impl<T> MemoryPool<T> where T: Sync + Send + 'static {
             drop(wait_list);
 
             self.objects.0.send(t).unwrap();
-            println!("push to queue:{}", self.len());
+            //println!("push to queue:{}", self.len());
         }
     }
 }
@@ -285,46 +285,46 @@ mod tests {
     //     let pool2 = pool.clone();
     //     let t1 = thread::spawn(move ||{
     //         let object1 = pool.lock().pull();
-    //         println!("retain 1");
+    //         //println!("retain 1");
     //         thread::sleep(std::time::Duration::from_secs(1));
     //
     //         let object2 = pool.pull();
-    //         println!("retain 2");
+    //         //println!("retain 2");
     //         thread::sleep(std::time::Duration::from_secs(1));
     //
     //         let object3 = pool.pull();
-    //         println!("retain 3");
+    //         //println!("retain 3");
     //         thread::sleep(std::time::Duration::from_secs(1));
     //
-    //         println!("drop 1");
+    //         //println!("drop 1");
     //         drop(object1);
     //         thread::sleep(std::time::Duration::from_secs(1));
     //
-    //         println!("drop 2");
+    //         //println!("drop 2");
     //         drop(object2);
     //         thread::sleep(std::time::Duration::from_secs(1));
     //
-    //         println!("drop 3");
+    //         //println!("drop 3");
     //         drop(object3);
     //         thread::sleep(std::time::Duration::from_secs(1));
     //
     //     });
     //     let t2 = thread::spawn(move ||{
-    //         println!(">>>wait for 2.5s");
+    //         //println!(">>>wait for 2.5s");
     //         thread::sleep(std::time::Duration::from_millis(2500));
-    //         println!(">>>try to retain 1.....");
+    //         //println!(">>>try to retain 1.....");
     //         let object2 = pool2.pull();
-    //         println!(">>>retained 1");
-    //         println!(">>>try to retain 2.....");
+    //         //println!(">>>retained 1");
+    //         //println!(">>>try to retain 2.....");
     //         let object2 = pool2.pull();
-    //         println!(">>>retained 1");
-    //         println!(">>>try to retain 3.....");
+    //         //println!(">>>retained 1");
+    //         //println!(">>>try to retain 3.....");
     //         let object2 = pool2.pull();
-    //         println!(">>>retained 1");
+    //         //println!(">>>retained 1");
     //
     //         thread::sleep(std::time::Duration::from_secs(1));
     //
-    //         println!(">>>dropped");
+    //         //println!(">>>dropped");
     //         drop(object2);
     //         thread::sleep(std::time::Duration::from_secs(1));
     //
