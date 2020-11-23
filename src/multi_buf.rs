@@ -389,9 +389,9 @@ impl MultiBuffer {
         }
         all_read_size
     }
-    pub fn write_to_file(&mut self, file_name: &PathBuf) -> usize {
+    pub fn write_to_file(&self, file_name: &PathBuf) -> usize {
         let mut open_option = fs::OpenOptions::new();
-        let mut file = open_option.write(true).open(&file_name).unwrap();
+        let mut file = open_option.create(true).write(true).open(&file_name).unwrap();
         let mut write_size_remain = self.total_len;
 
 
@@ -400,15 +400,20 @@ impl MultiBuffer {
             if current_write_size > write_size_remain {
                 current_write_size = write_size_remain;
             }
-            // loop {
-            let act_write_size = file.write_all(&mut self.buffers[i][..current_write_size]).unwrap();
-
-            if current_write_size != act_write_size {
-                panic!("write file {:?} failed : should {} actually {} ", &file_name, current_write_size, act_write_size);
-            } else {
-                write_size_remain -= current_write_size;
+            let mut write_round_size = 0;
+            loop {
+                match file.write(&self.buffers[i][write_round_size..current_write_size]) {
+                    Ok(write_size) => {
+                        write_round_size += write_size;
+                        if write_round_size >= current_write_size {
+                            break;
+                        }
+                    },
+                    Err(e) => {
+                        panic!("write file {:?} failed error:{} ", &file_name, e.to_string());
+                    }
+                }
             }
-            // }
         }
         self.total_len
     }
