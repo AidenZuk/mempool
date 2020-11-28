@@ -18,12 +18,12 @@ impl Semphore {
     }
 
     pub fn get(&self){
-        println!("lock sem:{}",self.name);
+        log::trace!("lock sem:{}",self.name);
         self.signal.1.recv().unwrap();
     }
     pub fn put(&self){
         self.signal.0.send(()).unwrap();
-        println!("release sem:{}",self.name);
+        log::trace!("release sem:{}",self.name);
     }
 }
 

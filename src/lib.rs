@@ -108,14 +108,13 @@ impl<T> MemoryPool<T> where T: Sync + Send + 'static {
     {
 
         // //println!("mempool remains:{}", cap);
-
+        log::trace!("mempool remains:{}", cap);
         let mut objects = channel::unbounded();
         for _ in 0..cap {
             &objects.0.send(init());
         }
         MemoryPool {
             objects,
-
             pending: Arc::new(Mutex::new(Vec::new())),
             waiting: Arc::new(Mutex::new(Vec::new())),
             run_block: Arc::new(Mutex::new(())),
@@ -137,13 +136,13 @@ impl<T> MemoryPool<T> where T: Sync + Send + 'static {
 
     #[inline]
     pub fn pending(&'static self, str: &str, sender: channel::Sender<Reusable<T>>, releasable: usize) -> (Option<Reusable<T>>, bool) {
-        //println!("pending item:{}", str);
+        log::trace!("pending item:{}", str);
         let _x = self.pending_block.lock();
         let ret = if let Ok(item) = self.objects.1.try_recv() {
-            //println!("get ok:{}", str);
+            log::trace!("get ok:{}", str);
             (Some(Reusable::new(&self, item)), false)
         } else if (self.pending.lock().len() == 0) {
-            //println!("get should pend:{}", str);
+            log::trace!("get should pend:{}", str);
             self.pending.lock().push(PendingInfo {
                 id: String::from(str),
                 notifier: sender.clone(),
@@ -152,16 +151,16 @@ impl<T> MemoryPool<T> where T: Sync + Send + 'static {
             (None, false)
         } else {
             let to_retry = { self.waiting.lock().len() * 15 + 2 };
-            //println!("try again :{} with retries backoff:{}", str, to_retry);
+            log::trace!("try again :{} with retries backoff:{}", str, to_retry);
             for i in 0..to_retry {
                 sleep(std::time::Duration::from_secs(1));
                 if let Ok(item) = self.objects.1.try_recv() {
-                    //println!("get ok:{}", str);
+                    log::trace!("get ok:{}", str);
                     return (Some(Reusable::new(&self, item)), false);
                 }
             }
 
-            //println!("get should sleep :{}", str);
+            log::trace!("get should sleep :{}", str);
             self.waiting.lock().push(WaitingInfo {
                 id: String::from(str),
                 notifier: sender.clone(),
@@ -177,18 +176,18 @@ impl<T> MemoryPool<T> where T: Sync + Send + 'static {
     #[inline]
     pub fn attach(&'static self, t: T) {
         let _x = self.run_block.lock();
-        //println!("attach started<<<<<<<<<<<<<<<<");
+        log::trace!("attach started<<<<<<<<<<<<<<<<");
 
-        //println!("recyled an item ");
+        log::trace!("recyled an item ");
         let mut wait_list = { self.waiting.lock() };
-        //println!("check waiting list ok :{}", wait_list.len());
+        log::trace!("check waiting list ok :{}", wait_list.len());
         if wait_list.len() > 0 && self.len() >= wait_list[0].min_request {
-            //println!("remove ok<<<<<<<<<<<<<<< ");
+            log::trace!("remove ok<<<<<<<<<<<<<<< ");
             let item = wait_list.remove(0);
-            //println!("start wakeup<<<<<<<<<<<<<<<<<<<");
+            log::trace!("start wakeup<<<<<<<<<<<<<<<<<<<");
             //&wait_list.remove(0);
 
-            //println!("free cnts:{}, waking up  {}/ with min req:{} now.... ", self.len(), item.id.clone(), item.min_request);
+            log::trace!("free cnts:{}, waking up  {}/ with min req:{} now.... ", self.len(), item.id.clone(), item.min_request);
             self.objects.0.send(t).unwrap();
             for i in 0..self.len() {
                 item.notifier.send(Reusable::new(&self, self.objects.1.recv().unwrap()));
@@ -199,7 +198,7 @@ impl<T> MemoryPool<T> where T: Sync + Send + 'static {
         } else if self.pending.lock().len() > 0 {
             drop(wait_list);
             let pending_item = self.pending.lock().remove(0);
-            //println!("fill pending:{}", pending_item.id);
+            log::trace!("fill pending:{}", pending_item.id);
             // thread::spawn(move || {
             //     pending_item.notifier.send(());
             // });
@@ -208,7 +207,7 @@ impl<T> MemoryPool<T> where T: Sync + Send + 'static {
             drop(wait_list);
 
             self.objects.0.send(t).unwrap();
-            //println!("push to queue:{}", self.len());
+            log::trace!("push to queue:{}", self.len());
         }
     }
 }

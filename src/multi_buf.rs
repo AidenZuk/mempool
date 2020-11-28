@@ -210,21 +210,21 @@ impl MultiBuffer {
         let (item, should_sleep) = self.mem_pool.pending(&self.id, sender.clone(), min_req);
 
         if let Some(item) = item {
-            //println!("{} get an item,left:{}", self.id.clone(), self.mem_pool.len());
+            log::trace!("{} get an item,left:{}", self.id.clone(), self.mem_pool.len());
             self.buffers.push(item);
         } else if !should_sleep {
-            //println!("{} pending an item ", self.id.clone());
+            log::trace!("{} pending an item ", self.id.clone());
             let result = receiver.recv().unwrap();
-            //println!("{} pending finished ", self.id.clone());
+            log::trace!("{} pending finished ", self.id.clone());
 
             self.buffers.push(result);
         } else {
 
-            //println!("{} sleep with min_req:{} ", self.id.clone(), min_req);
+            log::trace!("{} sleep with min_req:{} ", self.id.clone(), min_req);
 
             self.sleep();
 
-            //println!("{} sleeped ok:{} ", self.id.clone(), min_req);
+            log::trace!("{} sleeped ok:{} ", self.id.clone(), min_req);
             let mut recovered = 0;
             loop {
                 let result = receiver.recv().unwrap();
@@ -235,11 +235,11 @@ impl MultiBuffer {
                 }
             }
 
-            //println!("{} waked up with min_req:{} ", self.id.clone(), min_req);
+            log::trace!("{} waked up with min_req:{} ", self.id.clone(), min_req);
 
             //恢复
             self.wakeup();
-            //println!("{} waked up !!!! ", self.id.clone());
+            log::trace!("{} waked up !!!! ", self.id.clone());
         }
     }
     #[inline]
@@ -259,7 +259,7 @@ impl MultiBuffer {
     #[inline]
     pub fn write(&mut self, start: usize, len: usize, source: &[u8]) -> Result<()> {
         // if len == 1 {
-        //     //println!("???")
+        //     log::trace!("???")
         // }
         if source.len() != len {
             return Err(anyhow!("error in source size:{}/{}",len,source.len()));
@@ -312,11 +312,11 @@ impl MultiBuffer {
             }
 
             self.total_len = self.buffers.len() << self.seg_exp;
-            //  //println!("total len is : {},and seg is:{}, with request:{}, seg_exp :{}",self.total_len,self.buffers.len(),len,self.seg_exp);
+            //  log::trace!("total len is : {},and seg is:{}, with request:{}, seg_exp :{}",self.total_len,self.buffers.len(),len,self.seg_exp);
         }
     }
     fn sleep(&mut self) {
-        //println!("{} sleeping with min_req:{}", self.id.clone(), &self.buffers.len() + 1);
+        log::trace!("{} sleeping with min_req:{}", self.id.clone(), &self.buffers.len() + 1);
         self.store_files.clear();
         for (i, val) in self.buffers.iter().enumerate() {
             let file_name = self.path_parent.join(format!("cache_{}.dat", i));
@@ -326,12 +326,12 @@ impl MultiBuffer {
         }
         drop(&self.buffers);
         self.buffers = Vec::new();
-        //println!("{} slept ok",self.id.clone())
+        log::trace!("{} slept ok",self.id.clone())
         // sleep(std::time::Duration::from_secs(3));
     }
     fn wakeup(&mut self) {
         let total_count = self.store_files.len();
-        //println!("{} wake up with min_req:{}", self.id.clone(), total_count+1);
+        log::trace!("{} wake up with min_req:{}", self.id.clone(), total_count+1);
         for file_id in 0..total_count {
             let file_path = self.path_parent.join(format!("cache_{}.dat", file_id));
             let mut open_option = OpenOptions::new();
@@ -342,13 +342,13 @@ impl MultiBuffer {
                 file.read_exact(&mut data[..file_len as usize]);
                 //file.read_to_end(data);
 
-                //println!("remove mem cache file:{:?}", &file_path.display());
+                log::trace!("remove mem cache file:{:?}", &file_path.display());
                 fs::remove_file(&file_path);
             } else {
                 panic!("memory cache lost:{:?}", file_path.display())
             }
         }
-        //println!("wake up finished!");
+        log::trace!("wake up finished!");
         self.store_files.clear();
     }
 
@@ -496,7 +496,7 @@ mod Tests {
                     buffers.write(buf_len, 5, &test5_ele[..]);
                     assert_eq!(buffers.len(), buf_len * 2);
                     sleep(time::Duration::from_millis(rand::random::<u8>() as u64 * 10));
-                    //println!("------------sector_{} asked for more buffer",i);
+                    log::trace!("------------sector_{} asked for more buffer",i);
                     let test5_ele = vec![3, 5, 6, 7, 3];
                     buffers.write(buf_len * 2, 5, &test5_ele[..]);
                     assert_eq!(buffers.len(), buf_len * 3);
