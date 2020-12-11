@@ -141,14 +141,14 @@ impl<T> MemoryPool<T> where T: Sync + Send + 'static {
         let ret = if let Ok(item) = self.objects.1.try_recv() {
             log::trace!("get ok:{}", str);
             (Some(Reusable::new(&self, item)), false)
-        } else if (self.pending.lock().len() == 0) {
+   /*     } else if (self.pending.lock().len() == 0) {
             log::trace!("get should pend:{}", str);
             self.pending.lock().push(PendingInfo {
                 id: String::from(str),
                 notifier: sender.clone(),
             });
 
-            (None, false)
+            (None, false)*/
         } else {
             let to_retry = { self.waiting.lock().len() * 15 + 2 };
             log::trace!("try again :{} with retries backoff:{}", str, to_retry);
