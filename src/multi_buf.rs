@@ -85,11 +85,13 @@ impl MultiBuffer {
             PathBuf::from("/var/tmp")
         };
         path_parent = path_parent.join("mem_cache").join(id);
-        Command::new("mkdir")
-            .arg("-p")
-            .arg(&path_parent)
-            .output()
-            .expect("failed to create cache path");
+        log::info!("mem cache dir:{:?}",&path_parent);
+        std::fs::create_dir_all(&path_parent).expect("failed to create cache path");
+        // Command::new("mkdir")
+        //     .arg("-p")
+        //     .arg(&path_parent)
+        //     .output()
+        //     .expect("failed to create cache path");
         MultiBuffer {
             seg_exp,
             seg_len,
@@ -228,6 +230,7 @@ impl MultiBuffer {
             let mut recovered = 0;
             loop {
                 let result = receiver.recv().unwrap();
+                log::trace!("item_index:{},item_len:{}",recovered,result.len());
                 self.buffers.push(result);
                 recovered += 1;
                 if recovered > min_req {
@@ -320,7 +323,8 @@ impl MultiBuffer {
         self.store_files.clear();
         for (i, val) in self.buffers.iter().enumerate() {
             let file_name = self.path_parent.join(format!("cache_{}.dat", i));
-            fs::write(&file_name, val.deref());
+            fs::write(&file_name, val.deref()).unwrap();
+            log::debug!("cache file:{:?}",&file_name);
             self.store_files.push((&file_name).clone());
             drop(val)
         }
